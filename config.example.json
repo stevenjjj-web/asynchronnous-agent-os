@@ -1,0 +1,104 @@
+{
+  "gateway": {
+    "bind": "127.0.0.1",
+    "port": 3030,
+    "auth": { "token": null }
+  },
+  "runtime": {
+    "maxConcurrency": 4,
+    "tickMs": 200,
+    "leaseMs": 30000,
+    "maxStepsPerTurn": 6
+  },
+  "kernel": {
+    "heartbeatMs": 1000,
+    "serviceTimeoutMs": 15000,
+    "housekeepingMs": 200,
+    "interruptPollMs": 100,
+    "preemptionPriority": 90
+  },
+  "sensing": {
+    "enabled": true,
+    "pulseMs": 5000,
+    "monitorConcurrency": 2,
+    "defaultInboxMonitor": true,
+    "inboxPollMs": 3000
+  },
+  "cognition": {
+    "enabled": true,
+    "autoReflect": false,
+    "requireModel": true,
+    "idleAfterMs": 300000,
+    "intervalMs": 1800000,
+    "dailyGoalBudget": 4,
+    "attentionThreshold": 35,
+    "criticalThreshold": 75,
+    "deadlineHorizonMs": 3600000,
+    "blockedAfterMs": 900000,
+    "estimatedReflectionCostUsd": 0.02
+  },
+  "resources": {
+    "goalDefaults": {
+      "maxInputTokens": 120000,
+      "maxOutputTokens": 40000,
+      "maxCostUsd": 5,
+      "maxToolCalls": 100,
+      "maxWallTimeMs": 3600000,
+      "maxContextChars": 100000,
+      "maxFanOut": 8,
+      "maxDepth": 3
+    },
+    "globalDaily": { "maxTokens": 2000000, "maxCostUsd": 50, "maxToolCalls": 2000 },
+    "agentDaily": { "maxTokens": 500000, "maxCostUsd": 15, "maxToolCalls": 500 },
+    "pools": {
+      "default": 4,
+      "memory": 4,
+      "filesystem": 4,
+      "network": 3,
+      "browser": 1,
+      "code": 2,
+      "isolated-side-effects": 1
+    }
+  },
+  "security": {
+    "approvalRisk": "high",
+    "allowRemoteWithoutAuth": false,
+    "allowLocalBypass": true,
+    "pluginPaths": [],
+    "tools": {
+      "allow": ["*"],
+      "deny": []
+    },
+    "capabilities": {
+      "tools": ["*"],
+      "resourcePools": ["*"],
+      "filesystem": { "roots": ["."], "operations": ["list", "read", "write", "delete"] },
+      "network": { "domains": ["*"], "methods": ["GET"] },
+      "accounts": {},
+      "dataScopes": ["agent:self"],
+      "credentialRefs": []
+    },
+    "events": {
+      "requireSignature": false,
+      "replayWindowMs": 300000,
+      "sourceSecrets": {}
+    }
+  },
+  "agents": [
+    {
+      "id": "main",
+      "name": "Personal Agent",
+      "workspace": "./data/workspace",
+      "model": "default"
+    }
+  ],
+  "models": {
+    "default": {
+      "provider": "openai-compatible",
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKey": null,
+      "model": "gpt-4.1-mini",
+      "timeoutMs": 90000
+    }
+  }
+}

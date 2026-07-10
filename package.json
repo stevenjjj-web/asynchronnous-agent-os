@@ -1,0 +1,24 @@
+{
+  "name": "agent-os-runtime",
+  "version": "0.4.0",
+  "private": true,
+  "description": "Resident asynchronous personal agent operating system with supervised services, durable goals, interrupts and long-term memory",
+  "type": "module",
+  "bin": {
+    "agent-os": "src/cli.js"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "daemon": "node src/cli.js gateway start",
+    "stop": "node src/cli.js gateway stop",
+    "dev": "node --watch src/server.js",
+    "init": "node src/cli.js init",
+    "doctor": "node src/cli.js doctor",
+    "build": "node --check src/server.js && node --check src/cli.js",
+    "test": "node --test",
+    "check": "node --check src/server.js && node --check src/cli.js && node --test"
+  },
+  "engines": {
+    "node": ">=22.5"
+  }
+}
