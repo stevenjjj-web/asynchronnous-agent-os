@@ -22,11 +22,10 @@ export class OpenAICompatibleProvider {
   }
 
   get configured() {
-    return Boolean(this.config.apiKey && this.config.model && this.config.baseUrl);
+    return Boolean(this.config.model && this.config.baseUrl);
   }
 
-  async complete({ messages, tools = [], temperature = 0.2, signal }) {
-    if (!this.config.apiKey) throw new Error('No model is configured. Set AGENT_MODEL_API_KEY.');
+  async complete({ messages, tools = [], temperature = 0.2, signal, maxTokens }) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(new Error('Model request timed out')), this.config.timeoutMs ?? 90_000);
     const abort = () => controller.abort(signal?.reason);
@@ -35,13 +34,14 @@ export class OpenAICompatibleProvider {
       const response = await fetch(`${this.config.baseUrl.replace(/\/$/, '')}/chat/completions`, {
         method: 'POST',
         headers: {
-          authorization: `Bearer ${this.config.apiKey}`,
+          ...(this.config.apiKey ? { authorization: `Bearer ${this.config.apiKey}` } : {}),
           'content-type': 'application/json',
         },
         body: JSON.stringify({
           model: this.config.model,
           messages,
           temperature,
+          ...(Number.isFinite(maxTokens) ? { max_tokens: Math.floor(maxTokens) } : {}),
           ...(tools.length ? { tools, tool_choice: 'auto' } : {}),
         }),
         signal: controller.signal,
@@ -94,6 +94,6 @@ export class OfflineProvider {
 
 export function createProviderRegistry() {
   return new ProviderRegistry()
-    .register('openai-compatible', (config) => config.apiKey ? new OpenAICompatibleProvider(config) : new OfflineProvider(config))
+    .register('openai-compatible', (config) => new OpenAICompatibleProvider(config))
     .register('offline', (config) => new OfflineProvider(config));
 }

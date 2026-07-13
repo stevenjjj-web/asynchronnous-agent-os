@@ -1,14 +1,16 @@
 import { randomUUID } from 'node:crypto';
 
 export class SessionService {
-  constructor({ store, runtime, hooks }) {
+  constructor({ store, runtime, hooks, contractFactory, config }) {
     this.store = store;
     this.runtime = runtime;
     this.hooks = hooks;
+    this.contractFactory = contractFactory;
+    this.config = config;
   }
 
-  resolveSessionKey({ agentId = 'main', channel = 'terminal', peerKey = 'owner', threadKey }) {
-    return `agent:${agentId}:${channel}:${peerKey}${threadKey ? `:thread:${threadKey}` : ''}`;
+  resolveSessionKey({ tenantId = 'default', agentId = 'main', channel = 'terminal', peerKey = 'owner', threadKey }) {
+    return `tenant:${tenantId}:agent:${agentId}:${channel}:${peerKey}${threadKey ? `:thread:${threadKey}` : ''}`;
   }
 
   getOrCreate(input = {}) {
@@ -16,6 +18,7 @@ export class SessionService {
     return this.store.getOrCreateSession({
       sessionKey,
       agentId: input.agentId ?? 'main',
+      tenantId: input.tenantId ?? 'default',
       channel: input.channel ?? 'terminal',
       peerKey: input.peerKey ?? 'owner',
       title: input.title,
@@ -42,7 +45,28 @@ export class SessionService {
         }
       }
     }
-    const session = this.getOrCreate(input);
+    let session = this.getOrCreate(input);
+    const hasModelOverride = Object.prototype.hasOwnProperty.call(input, 'modelKey')
+      || Object.prototype.hasOwnProperty.call(input, 'modelId');
+    const agent = this.store.getAgent(session.agent_id);
+    if (!agent) throw new Error(`Unknown agent: ${session.agent_id}`);
+    const parentGoal = input.parentGoalId ? this.store.getGoal(input.parentGoalId) : null;
+    const spawnDepth = Number(input.spawnDepth ?? (parentGoal
+      ? Number(parentGoal.metadata.spawnDepth ?? 0) + 1
+      : session.metadata.spawnDepth ?? 0));
+    const modelKey = hasModelOverride
+      ? (input.modelKey ? String(input.modelKey) : agent.model_key)
+      : (parentGoal?.metadata.modelKey ?? session.metadata.modelKey ?? agent.model_key);
+    if (!this.config.models[modelKey]) throw new Error(`Unknown model config: ${modelKey}`);
+    const modelId = hasModelOverride
+      ? (input.modelId ? String(input.modelId) : this.config.models[modelKey].model)
+      : (parentGoal?.metadata.modelId ?? session.metadata.modelId ?? this.config.models[modelKey].model);
+    if (hasModelOverride) {
+      session = this.store.updateSessionMetadata(session.id, {
+        modelKey: input.modelKey == null || input.modelKey === '' ? null : String(input.modelKey),
+        modelId: input.modelId == null || input.modelId === '' ? null : String(input.modelId),
+      });
+    }
     const received = await this.hooks.emit('message_received', { session, text, input });
     if (received.cancelled) throw new Error('Message rejected by policy');
     const message = this.store.appendMessage({
@@ -58,6 +82,17 @@ export class SessionService {
     const deliveryId = randomUUID();
     const goalId = randomUUID();
     const priority = Math.max(10, Math.min(100, Number(input.priority ?? 80)));
+    const contract = this.contractFactory?.({
+      agentId: session.agent_id,
+      tenantId: session.tenant_id,
+      parentGoalId: input.parentGoalId,
+      deadlineAt: input.deadlineAt,
+      budget: input.budget,
+      capabilities: input.capabilities,
+      capabilityExpiresAt: input.capabilityExpiresAt,
+      spawnDepth,
+      createdBy: input.provenance ?? 'user',
+    });
     const plan = {
       goal: {
         id: goalId,
@@ -65,11 +100,21 @@ export class SessionService {
         objective: text,
         agentId: session.agent_id,
         sessionId: session.id,
+        tenantId: session.tenant_id,
+        deadlineAt: contract?.deadlineAt,
+        contract,
         metadata: {
           source: 'session', sessionKey: session.session_key, messageId: message.id,
+          createdBy: input.provenance ?? 'user',
+          cognitiveRepair: input.cognitiveRepair ?? null,
           parentGoalId: input.parentGoalId ?? null,
-          spawnDepth: Number(input.spawnDepth ?? session.metadata.spawnDepth ?? 0),
+          spawnDepth,
           priority,
+          modelKey,
+          modelId,
+          conflictKeys: input.conflictKeys ?? [],
+          resourceClaims: input.resourceClaims ?? (input.conflictKeys ?? []).map((scope) => ({ scope, mode: 'exclusive' })),
+          assumptions: input.assumptions ?? [],
         },
       },
       tasks: [

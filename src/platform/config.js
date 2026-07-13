@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, renameSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 
 function merge(base, override) {
@@ -12,6 +12,51 @@ function merge(base, override) {
   return output;
 }
 
+function readPath(object, path) {
+  return String(path ?? '').split('.').filter(Boolean).reduce((value, key) => value?.[key], object);
+}
+
+function loadSecretValues(path) {
+  if (!path || !existsSync(path)) return {};
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch (error) {
+    throw new Error(`Secret file is invalid: ${path}`, { cause: error });
+  }
+}
+
+function resolveModelSecrets(config) {
+  const secretFile = resolve(config.security.secretFile ?? join(config.home, 'secrets.json'));
+  const secrets = loadSecretValues(secretFile);
+  const models = Object.fromEntries(Object.entries(config.models ?? {}).map(([key, model]) => {
+    const environmentValue = model.apiKeyEnv ? process.env[model.apiKeyEnv] : null;
+    const referencedValue = model.apiKeyRef ? readPath(secrets, model.apiKeyRef) : null;
+    return [key, {
+      ...model,
+      apiKey: environmentValue ?? referencedValue ?? model.apiKey ?? null,
+    }];
+  }));
+  const gatewayAuth = config.gateway.auth ?? {};
+  const gatewayToken = (gatewayAuth.tokenEnv ? process.env[gatewayAuth.tokenEnv] : null)
+    ?? (gatewayAuth.tokenRef ? readPath(secrets, gatewayAuth.tokenRef) : null)
+    ?? gatewayAuth.token
+    ?? null;
+  return {
+    ...config,
+    gateway: { ...config.gateway, auth: { ...gatewayAuth, token: gatewayToken } },
+    security: { ...config.security, secretFile },
+    models,
+  };
+}
+
+export function serializableConfig(config) {
+  const output = structuredClone(config);
+  delete output.configPath;
+  if (output.gateway?.auth) delete output.gateway.auth.token;
+  for (const model of Object.values(output.models ?? {})) delete model.apiKey;
+  return output;
+}
+
 export function defaultConfig({ projectRoot = process.cwd(), home } = {}) {
   const stateHome = resolve(home ?? process.env.AGENT_OS_HOME ?? join(projectRoot, 'data'));
   return {
@@ -21,7 +66,11 @@ export function defaultConfig({ projectRoot = process.cwd(), home } = {}) {
     gateway: {
       bind: process.env.AGENT_GATEWAY_BIND ?? '127.0.0.1',
       port: Number(process.env.PORT ?? 3030),
-      auth: { token: process.env.AGENT_GATEWAY_TOKEN ?? null },
+      auth: {
+        token: process.env.AGENT_GATEWAY_TOKEN ?? null,
+        tokenEnv: 'AGENT_GATEWAY_TOKEN',
+        tokenRef: null,
+      },
       rateLimit: { windowMs: 60_000, maxWrites: 120 },
     },
     runtime: {
@@ -84,8 +133,10 @@ export function defaultConfig({ projectRoot = process.cwd(), home } = {}) {
     },
     operations: { reconcileIntervalMs: 30_000, maxReconcileAttempts: 12 },
     session: { dmScope: 'per-channel-peer', maxContextMessages: 40, maxContextChars: 100_000 },
-    memory: { maxRecallEntries: 8, maxEntryChars: 12_000 },
+    memory: { maxRecallEntries: 8, maxEntryChars: 12_000, captureMode: 'explicit' },
     security: {
+      tenantId: 'default',
+      secretFile: join(stateHome, 'secrets.json'),
       approvalRisk: 'high',
       allowRemoteWithoutAuth: false,
       allowLocalBypass: true,
@@ -96,12 +147,13 @@ export function defaultConfig({ projectRoot = process.cwd(), home } = {}) {
         resourcePools: ['*'],
         filesystem: { roots: ['.'], operations: ['list', 'read', 'write', 'delete'] },
         network: { domains: ['*'], methods: ['GET'] },
-        accounts: {},
+        accounts: { channel: ['*'] },
         dataScopes: ['agent:self'],
         credentialRefs: [],
+        constraints: {},
       },
       events: {
-        requireSignature: false,
+        requireSignature: true,
         replayWindowMs: 300_000,
         sourceSecrets: {},
       },
@@ -117,27 +169,52 @@ export function defaultConfig({ projectRoot = process.cwd(), home } = {}) {
         provider: 'openai-compatible',
         baseUrl: process.env.AGENT_MODEL_BASE_URL ?? 'https://api.openai.com/v1',
         apiKey: process.env.AGENT_MODEL_API_KEY ?? process.env.OPENAI_API_KEY ?? null,
+        apiKeyEnv: 'AGENT_MODEL_API_KEY',
+        apiKeyRef: null,
         model: process.env.AGENT_MODEL_ID ?? 'gpt-4.1-mini',
         timeoutMs: Number(process.env.AGENT_MODEL_TIMEOUT_MS ?? 90_000),
+        inputCostPerMillion: Number(process.env.AGENT_MODEL_INPUT_COST_PER_MILLION ?? 0),
+        outputCostPerMillion: Number(process.env.AGENT_MODEL_OUTPUT_COST_PER_MILLION ?? 0),
       },
     },
+    onboarding: { completedAt: null, version: null },
   };
 }
 
 export function loadConfig({ projectRoot = process.cwd(), home, configPath } = {}) {
   const defaults = defaultConfig({ projectRoot, home });
   const path = resolve(configPath ?? process.env.AGENT_OS_CONFIG ?? join(defaults.home, 'config.json'));
-  if (!existsSync(path)) return { ...defaults, configPath: path };
+  if (!existsSync(path)) return resolveModelSecrets({ ...defaults, configPath: path });
   const parsed = JSON.parse(readFileSync(path, 'utf8'));
   const config = merge(defaults, parsed);
-  return { ...config, configPath: path };
+  return resolveModelSecrets({ ...config, configPath: path });
 }
 
 export function writeDefaultConfig(path, options = {}) {
   const config = defaultConfig(options);
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`, { flag: 'wx' });
+  writeConfigFile(path, config, { exclusive: true });
   return config;
+}
+
+export function writeConfigFile(path, config, { exclusive = false } = {}) {
+  mkdirSync(dirname(path), { recursive: true });
+  if (exclusive && existsSync(path)) throw new Error(`Config already exists: ${path}`);
+  const temporary = `${path}.${process.pid}.tmp`;
+  writeFileSync(temporary, `${JSON.stringify(serializableConfig(config), null, 2)}\n`, { mode: 0o600 });
+  renameSync(temporary, path);
+  chmodSync(path, 0o600);
+  return path;
+}
+
+export function writeSecretFile(path, values) {
+  mkdirSync(dirname(path), { recursive: true });
+  const existing = loadSecretValues(path);
+  const merged = merge(existing, values);
+  const temporary = `${path}.${process.pid}.tmp`;
+  writeFileSync(temporary, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
+  renameSync(temporary, path);
+  chmodSync(path, 0o600);
+  return path;
 }
 
 export function validateConfig(config) {
@@ -148,12 +225,18 @@ export function validateConfig(config) {
   if (!Number.isInteger(config.kernel.heartbeatMs) || config.kernel.heartbeatMs < 50) errors.push('kernel.heartbeatMs must be at least 50');
   if (!Number.isInteger(config.kernel.serviceTimeoutMs) || config.kernel.serviceTimeoutMs <= config.kernel.heartbeatMs) errors.push('kernel.serviceTimeoutMs must exceed kernel.heartbeatMs');
   if (!Number.isInteger(config.resources.goalDefaults.maxToolCalls) || config.resources.goalDefaults.maxToolCalls < 1) errors.push('resources.goalDefaults.maxToolCalls must be positive');
+  if (!Number.isFinite(config.resources.goalDefaults.maxCostUsd) || config.resources.goalDefaults.maxCostUsd < 0) errors.push('resources.goalDefaults.maxCostUsd must be non-negative');
   const ids = new Set();
   for (const agent of config.agents ?? []) {
     if (!agent.id || !/^[a-z0-9][a-z0-9_-]*$/i.test(agent.id)) errors.push(`Invalid agent id: ${agent.id}`);
     if (ids.has(agent.id)) errors.push(`Duplicate agent id: ${agent.id}`);
     ids.add(agent.id);
     if (!config.models[agent.model]) errors.push(`Agent ${agent.id} references unknown model ${agent.model}`);
+  }
+  for (const [name, model] of Object.entries(config.models ?? {})) {
+    if (!['offline', 'openai-compatible'].includes(model.provider)) errors.push(`Model ${name} has an unsupported provider: ${model.provider}`);
+    if (model.provider === 'openai-compatible' && !model.baseUrl) errors.push(`Model ${name} requires baseUrl`);
+    if (!model.model) errors.push(`Model ${name} requires a model id`);
   }
   if (!['127.0.0.1', '::1', 'localhost'].includes(config.gateway.bind)
     && !config.gateway.auth.token

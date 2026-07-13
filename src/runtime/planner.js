@@ -37,7 +37,14 @@ export class IntentPlanner {
         id: goalId,
         title: objective.length > 30 ? `${objective.slice(0, 30)}…` : objective,
         objective,
-        metadata: { replyTopic: 'user.reply', replyKey, createdBy: 'intent-planner-v1' },
+        metadata: {
+          replyTopic: 'user.reply',
+          replyKey,
+          createdBy: 'intent-planner-v1',
+          conflictKeys: options.conflictKeys ?? [],
+          resourceClaims: options.resourceClaims ?? (options.conflictKeys ?? []).map((scope) => ({ scope, mode: 'exclusive' })),
+          assumptions: options.assumptions ?? [],
+        },
       },
       tasks: [
         {

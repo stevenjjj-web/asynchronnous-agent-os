@@ -32,6 +32,8 @@ export function createWorkspaceTools(store) {
       name: 'workspace_list',
       description: 'Lists files and directories in the personal agent workspace.',
       risk: 'low',
+      resourcePool: 'filesystem',
+      capability: { filesystemOperation: 'list' },
       parameters: {
         type: 'object',
         properties: { path: { type: 'string' } },
@@ -57,6 +59,8 @@ export function createWorkspaceTools(store) {
       name: 'workspace_read',
       description: 'Reads a UTF-8 text file from the personal agent workspace.',
       risk: 'low',
+      resourcePool: 'filesystem',
+      capability: { filesystemOperation: 'read' },
       parameters: {
         type: 'object',
         properties: { path: { type: 'string' }, maxChars: { type: 'integer', minimum: 1, maximum: 200000 } },
@@ -73,6 +77,9 @@ export function createWorkspaceTools(store) {
       name: 'workspace_write',
       description: 'Creates or overwrites a UTF-8 text file inside the personal agent workspace.',
       risk: 'medium',
+      resourcePool: 'filesystem',
+      capability: { filesystemOperation: 'write' },
+      sideEffect: { mode: 'local-idempotent' },
       parameters: {
         type: 'object',
         properties: { path: { type: 'string' }, content: { type: 'string' } },
@@ -91,6 +98,9 @@ export function createWorkspaceTools(store) {
       name: 'workspace_delete',
       description: 'Permanently deletes a file or empty directory from the personal agent workspace.',
       risk: 'high',
+      resourcePool: 'isolated-side-effects',
+      capability: { filesystemOperation: 'delete' },
+      sideEffect: { mode: 'non-idempotent' },
       parameters: {
         type: 'object',
         properties: { path: { type: 'string' }, reason: { type: 'string' } },
@@ -109,6 +119,8 @@ export function createWorkspaceTools(store) {
       name: 'http_fetch',
       description: 'Reads text from a public HTTPS URL. Redirects, private addresses, and non-text responses are rejected.',
       risk: 'medium',
+      resourcePool: 'network',
+      capability: { networkUrlArg: 'url', networkMethod: 'GET' },
       parameters: {
         type: 'object',
         properties: { url: { type: 'string' }, maxChars: { type: 'integer', minimum: 1, maximum: 200000 } },
@@ -137,7 +149,7 @@ export async function safeFetchText(url, { maxChars = 60_000, timeoutMs = 15_000
     const response = await fetch(parsed, {
       redirect: 'error',
       signal: controller.signal,
-      headers: { 'user-agent': 'AgentOS/0.4' },
+      headers: { 'user-agent': 'AgentOS/0.5' },
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const type = response.headers.get('content-type') ?? '';

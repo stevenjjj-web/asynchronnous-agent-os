@@ -17,7 +17,7 @@ export class GatewayClient {
         },
       });
     } catch (error) {
-      throw new Error(`Gateway unavailable at ${this.baseUrl}. Start it with: agent-os gateway run`, { cause: error });
+      throw new Error(`Gateway unavailable at ${this.baseUrl}. Start it with: agent-os gateway start`, { cause: error });
     }
     const contentType = response.headers.get('content-type') ?? '';
     const body = contentType.includes('application/json') ? await response.json() : await response.text();

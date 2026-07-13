@@ -2,7 +2,7 @@ import { statSync, watch } from 'node:fs';
 import { join } from 'node:path';
 import { waitForAbort } from './async-signal.js';
 
-export function createWorkspaceInboxListener({ store, monitoring, heartbeatMs }) {
+export function createWorkspaceInboxListener({ store, monitoring, heartbeatMs, tenantId }) {
   return {
     description: 'Uses operating-system file notifications to wake durable workspace inbox monitors immediately.',
     async run({ signal, heartbeat }) {
@@ -13,7 +13,7 @@ export function createWorkspaceInboxListener({ store, monitoring, heartbeatMs })
       let lastError = null;
       const wake = (agentId) => {
         notifications += 1;
-        for (const monitor of store.listMonitors({ agentId })) {
+        for (const monitor of store.listMonitors({ agentId, tenantId })) {
           if (monitor.enabled && monitor.sensor_type === 'workspace_inbox') monitoring.runNow(monitor.id);
         }
       };

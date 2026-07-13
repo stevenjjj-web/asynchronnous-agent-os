@@ -5,17 +5,21 @@ const CONTROL_KEY = 'cognition.control';
 const CYCLE_KEY = 'cognition.lastCycle';
 
 export class CognitionService {
-  constructor({ store, sessions, eventBus, config, modelAvailable }) {
+  constructor({ store, sessions, eventBus, attention, interrupts, config, modelAvailable }) {
     this.store = store;
     this.sessions = sessions;
     this.eventBus = eventBus;
+    this.attention = attention;
+    this.interrupts = interrupts;
     this.config = config;
     this.modelAvailable = modelAvailable;
     this.signal = new AsyncSignal();
     this.lastActivityAt = Date.now();
+    this.lastAssessmentAt = 0;
     this.onChange = (update) => {
       if (['SYSTEM_PULSE', 'COGNITION_STATUS', 'EVENT_PUBLISHED'].includes(update?.type)) return;
       this.lastActivityAt = Date.now();
+      this.signal.notify('activity');
     };
   }
 
@@ -45,6 +49,9 @@ export class CognitionService {
       control: this.getControl(),
       lastCycle: this.store.getSystemState(CYCLE_KEY)?.value ?? null,
       lastActivityAt: this.lastActivityAt,
+      lastAssessment: this.store.listAttentionAssessments({
+        agentId: 'main', tenantId: this.config.security.tenantId, limit: 1,
+      })[0] ?? null,
     };
   }
 
@@ -72,10 +79,17 @@ export class CognitionService {
   async tick({ control, forced = false }) {
     const timestamp = Date.now();
     if (!control.enabled && !forced) return { action: 'dormant', at: timestamp };
-    const stats = this.store.getStats();
-    const runnable = (stats.tasks.READY ?? 0) + (stats.tasks.RUNNING ?? 0);
-    if (runnable > 0) return { action: 'defer-active-work', runnable, at: timestamp };
-    if (!forced && timestamp - this.lastActivityAt < this.config.cognition.idleAfterMs) {
+    const assessmentInterval = Math.min(30_000, Math.max(1_000, Math.floor(this.config.cognition.idleAfterMs / 4)));
+    if (!forced && timestamp - this.lastAssessmentAt < assessmentInterval) {
+      return { action: 'attention-heartbeat', at: timestamp };
+    }
+    const assessment = this.attention.assess('main');
+    this.lastAssessmentAt = timestamp;
+    const runnable = assessment.signals.runnableCount;
+    if (!forced && runnable > 0 && !assessment.decision.critical) {
+      return { action: 'defer-active-work', runnable, assessmentId: assessment.id, at: timestamp };
+    }
+    if (!forced && !assessment.decision.shouldWake && timestamp - this.lastActivityAt < this.config.cognition.idleAfterMs) {
       return { action: 'defer-not-idle', at: timestamp };
     }
     const lastCycle = this.store.getSystemState(CYCLE_KEY)?.value;
@@ -84,17 +98,34 @@ export class CognitionService {
     }
 
     const cycleId = randomUUID();
-    const base = { id: cycleId, at: timestamp, forced, autoReflect: Boolean(control.autoReflect) };
+    const base = {
+      id: cycleId,
+      at: timestamp,
+      forced,
+      autoReflect: Boolean(control.autoReflect),
+      assessmentId: assessment.id,
+      attentionScore: assessment.score,
+      attentionReason: assessment.decision.reason,
+    };
     this.eventBus.publish({
-      topic: 'cognition.idle',
+      topic: 'cognition.attention',
       correlationKey: 'kernel',
       payload: base,
       source: 'cognition-loop',
       idempotencyKey: `cognition-cycle:${cycleId}`,
+      tenantId: this.config.security.tenantId,
+      agentId: 'main',
+      authenticated: true,
+      authSubject: 'kernel:cognition',
     });
 
     if (!control.autoReflect) {
-      const result = { ...base, action: 'observed-idle' };
+      const result = { ...base, action: assessment.decision.shouldWake ? 'attention-observed' : 'no-attention-value' };
+      this.store.setSystemState(CYCLE_KEY, result);
+      return result;
+    }
+    if (!forced && !assessment.decision.shouldWake) {
+      const result = { ...base, action: 'skipped-low-expected-value' };
       this.store.setSystemState(CYCLE_KEY, result);
       return result;
     }
@@ -115,6 +146,7 @@ export class CognitionService {
 
     const session = this.sessions.getOrCreate({
       agentId: 'main',
+      tenantId: this.config.security.tenantId,
       channel: 'internal',
       peerKey: 'cognition-loop',
       metadata: { system: true, cognition: true },
@@ -122,15 +154,48 @@ export class CognitionService {
     const accepted = await this.sessions.submit({
       sessionKey: session.session_key,
       text: [
-        'Run a bounded idle cognition cycle.',
-        'Review open goals, recent durable events, waiting work, and relevant long-term memory.',
+        'Run a bounded attention-allocation review.',
+        `The deterministic attention score is ${assessment.score.toFixed(2)} and the primary signal is ${assessment.decision.reason}.`,
+        `Signals: ${JSON.stringify(assessment.signals)}.`,
+        'Review goal drift, new evidence, deadline risk, conflicts, and long-blocked alternatives.',
         'Identify at most one useful low-risk follow-up. Do not perform irreversible actions.',
         'If nothing merits action, state that clearly and finish without creating more work.',
       ].join(' '),
       messageId: `cognition:${cycleId}`,
       provenance: 'cognition-loop',
-      priority: 30,
+      priority: assessment.decision.critical ? 95 : Math.min(80, 40 + Math.round(assessment.score / 2)),
+      deadlineAt: timestamp + 300_000,
+      budget: {
+        maxInputTokens: 12_000,
+        maxOutputTokens: 2_000,
+        maxCostUsd: Math.max(this.config.cognition.estimatedReflectionCostUsd * 2, 0.05),
+        maxToolCalls: 8,
+        maxWallTimeMs: 300_000,
+        maxContextChars: 30_000,
+        maxFanOut: 1,
+        maxDepth: 1,
+      },
+      capabilities: {
+        tools: ['memory_search', 'goal_status', 'kernel_status', 'monitor_status', 'workspace_list', 'workspace_read'],
+        resourcePools: ['default', 'memory', 'filesystem'],
+        filesystem: { roots: ['.'], operations: ['list', 'read'] },
+        network: { domains: [], methods: [] },
+        accounts: {},
+        dataScopes: ['agent:self'],
+        credentialRefs: [],
+      },
     });
+    if (assessment.decision.critical && runnable > 0) {
+      this.interrupts.raise({
+        agentId: 'main',
+        goalId: accepted.goal.id,
+        kind: 'attention',
+        priority: 95,
+        force: false,
+        reason: `Critical attention signal: ${assessment.decision.reason}`,
+        payload: { assessmentId: assessment.id, score: assessment.score },
+      });
+    }
     this.store.setSystemState(budgetKey, { used: budget.used + 1, updatedAt: timestamp });
     const result = { ...base, action: 'reflection-goal-created', goalId: accepted.goal.id };
     this.store.setSystemState(CYCLE_KEY, result);

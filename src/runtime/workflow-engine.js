@@ -36,12 +36,13 @@ export class WorkflowEngine {
   }
 
   async executeTurn(task, { signal } = {}) {
+    const goal = this.store.getGoal(task.goal_id);
     let snapshot = {
       pc: 0,
       variables: {},
       checkpoints: [],
       ...task.snapshot,
-      variables: { objective: this.store.getGoal(task.goal_id)?.objective, ...(task.snapshot?.variables ?? {}) },
+      variables: { objective: goal?.objective, ...(task.snapshot?.variables ?? {}) },
     };
 
     for (let quantum = 0; quantum < this.maxStepsPerTurn; quantum += 1) {
@@ -212,6 +213,10 @@ export class WorkflowEngine {
             payload,
             source: `task:${task.id}`,
             idempotencyKey: `task:${task.id}:step:${snapshot.pc}`,
+            tenantId: goal?.tenant_id,
+            agentId: goal?.agent_id,
+            authenticated: true,
+            authSubject: `task:${task.id}`,
           });
           snapshot = checkpoint({ ...snapshot, pc: snapshot.pc + 1 }, step, { topic, correlationKey });
           this.store.checkpointTask(task.id, snapshot, null, task.lease_token);

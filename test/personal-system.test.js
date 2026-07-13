@@ -366,13 +366,13 @@ test('a resident kernel process and supervised services stay alive while idle', 
   try {
     const first = await waitFor(() => {
       const processes = system.store.listKernelProcesses({ status: 'RUNNING' });
-      return processes.length === 6 ? processes : null;
+      return processes.length === 7 ? processes : null;
     });
     const root = first.find((processRecord) => processRecord.kind === 'kernel');
     assert.equal(root.host_pid, process.pid);
     assert.deepEqual(
       first.filter((processRecord) => processRecord.kind === 'resident-service').map((item) => item.name).sort(),
-      ['cognition-loop', 'interrupt-reactor', 'io-reactor', 'listener:workspace-inbox', 'scheduler'],
+      ['cognition-loop', 'interrupt-reactor', 'io-reactor', 'listener:workspace-inbox', 'plan-repair-reactor', 'scheduler'],
     );
     const heartbeat = root.heartbeat_at;
     await waitFor(() => system.store.getKernelProcess(root.id).heartbeat_at > heartbeat);

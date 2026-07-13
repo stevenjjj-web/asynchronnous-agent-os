@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { ActionControl, isActionControl } from './tool-registry.js';
 
 function parseArguments(raw) {
@@ -23,20 +24,41 @@ function assistantMessage(response) {
   };
 }
 
+function evidenceRecord({ id, sourceType = 'tool', source, value, observedAt = Date.now() }) {
+  const serialized = typeof value === 'string' ? value : JSON.stringify(value);
+  return {
+    id,
+    sourceType,
+    source,
+    observedAt,
+    digest: createHash('sha256').update(serialized).digest('hex'),
+    excerpt: serialized.slice(0, 500),
+  };
+}
+
 export class AgentTurnService {
-  constructor({ store, config, providers, tools, contextBuilder, hooks }) {
+  constructor({ store, config, providers, tools, contextBuilder, hooks, resources }) {
     this.store = store;
     this.config = config;
     this.providers = providers;
     this.tools = tools;
     this.contextBuilder = contextBuilder;
     this.hooks = hooks;
+    this.resources = resources;
   }
 
-  resolveProvider(agent) {
-    const modelConfig = this.config.models[agent.model_key];
-    if (!modelConfig) throw new Error(`Unknown model config: ${agent.model_key}`);
-    return this.providers.create(modelConfig.provider, modelConfig);
+  resolveModel(agent, session, goal) {
+    const modelKey = goal?.metadata.modelKey ?? session.metadata.modelKey ?? agent.model_key;
+    const baseConfig = this.config.models[modelKey];
+    if (!baseConfig) throw new Error(`Unknown model config: ${modelKey}`);
+    const modelId = goal?.metadata.modelId ?? session.metadata.modelId ?? baseConfig.model;
+    const modelConfig = { ...baseConfig, model: modelId };
+    return {
+      modelKey,
+      modelId,
+      modelConfig,
+      provider: this.providers.create(modelConfig.provider, modelConfig),
+    };
   }
 
   async run(input, context) {
@@ -47,32 +69,62 @@ export class AgentTurnService {
     const goal = this.store.getGoal(context.task.goal_id);
     const built = context.actionState?.messages
       ? { session, agent: this.store.getAgent(session.agent_id), messages: context.actionState.messages }
-      : this.contextBuilder.build(session.id, recalled, { throughMessageId: goal?.metadata.messageId });
-    const provider = this.resolveProvider(built.agent);
+      : this.contextBuilder.build(session.id, recalled, {
+          throughMessageId: goal?.metadata.messageId,
+          goalId: context.task.goal_id,
+        });
+    const selectedModel = this.resolveModel(built.agent, session, goal);
     let messages = built.messages;
     let pending = context.actionState?.pending ?? null;
     const trace = [...(context.actionState?.trace ?? [])];
+    const evidence = context.actionState?.evidence
+      ? [...context.actionState.evidence]
+      : recalled.map((memory) => evidenceRecord({
+          id: `memory:${memory.id}`,
+          sourceType: 'memory',
+          source: memory.id,
+          value: memory.content,
+          observedAt: memory.created_at,
+        }));
 
     if (pending) {
       const resumed = await this.resumePendingTool(pending, context, session);
       if (isActionControl(resumed) && resumed.__agentControl === 'wait') {
-        return ActionControl.wait(resumed.wait, { messages, pending: { ...pending, toolState: resumed.state }, trace });
+        return ActionControl.wait(resumed.wait, { messages, pending: { ...pending, toolState: resumed.state }, trace, evidence });
       }
+      const resumedValue = isActionControl(resumed) ? resumed.value : resumed;
       messages = [...messages, {
         role: 'tool',
         tool_call_id: pending.call.id,
-        content: JSON.stringify(isActionControl(resumed) ? resumed.value : resumed),
+        content: JSON.stringify(resumedValue),
       }];
+      evidence.push(evidenceRecord({
+        id: `tool:${context.task.id}:${pending.call.id}`,
+        source: pending.call.name,
+        value: resumedValue,
+      }));
       trace.push({ tool: pending.call.name, resumedAt: Date.now() });
       pending = null;
     }
 
     for (let iteration = 0; iteration < 8; iteration += 1) {
       const prepared = await this.hooks.emit('before_model_call', { session, task: context.task, messages });
-      const response = await provider.complete({
-        messages: prepared.messages ?? messages,
+      const modelMessages = prepared.messages ?? messages;
+      const modelConfig = selectedModel.modelConfig;
+      const allowance = this.resources?.assertModelCall(context.task.goal_id, modelMessages, modelConfig);
+      const response = await selectedModel.provider.complete({
+        messages: modelMessages,
         tools: this.tools.modelDefinitions(),
         signal: context.signal,
+        maxTokens: allowance?.maxOutputTokens,
+      });
+      this.resources?.recordModelUsage({
+        goalId: context.task.goal_id,
+        usage: response.usage,
+        estimatedInputTokens: allowance?.estimatedInputTokens,
+        estimatedOutputTokens: Math.ceil(JSON.stringify(response).length / 4),
+        modelConfig,
+        idempotencyKey: `${context.idempotencyKey}:model:${iteration}:attempt:${context.task.attempt}`,
       });
       await this.hooks.emit('after_model_call', { session, task: context.task, response });
       messages = [...messages, assistantMessage(response)];
@@ -81,8 +133,10 @@ export class AgentTurnService {
         return ActionControl.value({
           text: response.content ?? '',
           usage: response.usage,
-          model: built.agent.model_key,
+          model: selectedModel.modelId,
+          modelKey: selectedModel.modelKey,
           trace,
+          evidence,
         });
       }
 
@@ -113,7 +167,7 @@ export class AgentTurnService {
             topic: 'approval.resolved',
             correlationKey: approval.id,
             reason: `Tool ${call.name} requires user approval`,
-          }, { messages, pending: { type: 'approval', call, args, approvalId: approval.id }, trace });
+          }, { messages, pending: { type: 'approval', call, args, approvalId: approval.id }, trace, evidence });
         }
 
         const result = await this.tools.execute(call.name, args, {
@@ -128,13 +182,20 @@ export class AgentTurnService {
             messages,
             pending: { type: 'tool', call, args, toolState: result.state, wait: result.wait },
             trace,
+            evidence,
           });
         }
+        const toolValue = isActionControl(result) ? result.value : result;
         messages.push({
           role: 'tool',
           tool_call_id: call.id,
-          content: JSON.stringify(isActionControl(result) ? result.value : result),
+          content: JSON.stringify(toolValue),
         });
+        evidence.push(evidenceRecord({
+          id: `tool:${context.task.id}:${call.id}`,
+          source: call.name,
+          value: toolValue,
+        }));
         trace.push({ tool: call.name, at: Date.now() });
       }
     }

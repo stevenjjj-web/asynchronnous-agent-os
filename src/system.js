@@ -16,6 +16,16 @@ import { CognitionService } from './kernel/cognition-service.js';
 import { KernelDaemon } from './kernel/kernel-daemon.js';
 import { ListenerRegistry } from './kernel/listener-registry.js';
 import { createWorkspaceInboxListener } from './kernel/workspace-inbox-listener.js';
+import { ResourceKernel } from './kernel/resource-kernel.js';
+import { ResourcePoolManager } from './kernel/resource-pools.js';
+import { CapabilityKernel, CredentialBroker } from './kernel/capability-kernel.js';
+import { OperationManager } from './kernel/operation-manager.js';
+import { AttentionAllocator } from './kernel/attention-allocator.js';
+import { EventAuthenticator } from './kernel/event-authenticator.js';
+import { SandboxRegistry } from './kernel/sandbox-registry.js';
+import { AttentionInbox } from './kernel/attention-inbox.js';
+import { ObservabilityKernel } from './kernel/observability-kernel.js';
+import { PlanRepairService } from './kernel/plan-repair-service.js';
 
 export class PersonalAgentSystem {
   constructor(config) {
@@ -29,15 +39,33 @@ export class PersonalAgentSystem {
       leaseMs: config.runtime.leaseMs,
     });
     this.store = this.runtime.store;
+    this.observability = new ObservabilityKernel({ store: this.store, config });
     this.eventBus = this.runtime.eventBus;
     this.scheduler = this.runtime.scheduler;
     this.actions = this.runtime.actions;
     this.hooks = new HookBus();
     this.providers = createProviderRegistry();
+    this.eventAuthenticator = new EventAuthenticator({ config });
+    this.resources = new ResourceKernel({ store: this.store, config });
+    this.capabilities = new CapabilityKernel({ store: this.store, config });
+    this.resourcePools = new ResourcePoolManager(config.resources.pools);
+    this.credentials = new CredentialBroker({ store: this.store });
+    this.sandboxes = new SandboxRegistry();
+    this.operations = new OperationManager({
+      store: this.store,
+      config,
+      pools: this.resourcePools,
+    });
     this.tools = new ToolRegistry({
       approvalRisk: config.security.approvalRisk,
       hooks: this.hooks,
       policy: config.security.tools,
+      capabilities: this.capabilities,
+      resources: this.resources,
+      pools: this.resourcePools,
+      operations: this.operations,
+      credentials: this.credentials,
+      sandboxes: this.sandboxes,
     });
 
     for (const agent of config.agents) {
@@ -45,7 +73,7 @@ export class PersonalAgentSystem {
       this.store.upsertAgent(agent);
     }
     this.memory = new MemoryService({ store: this.store, config });
-    this.contextBuilder = new ContextBuilder({ store: this.store, memory: this.memory, config });
+    this.contextBuilder = new ContextBuilder({ store: this.store, memory: this.memory, resources: this.resources, config });
     this.agentTurn = new AgentTurnService({
       store: this.store,
       config,
@@ -53,8 +81,21 @@ export class PersonalAgentSystem {
       tools: this.tools,
       contextBuilder: this.contextBuilder,
       hooks: this.hooks,
+      resources: this.resources,
     });
-    this.sessions = new SessionService({ store: this.store, runtime: this.runtime, hooks: this.hooks });
+    this.sessions = new SessionService({
+      store: this.store,
+      runtime: this.runtime,
+      hooks: this.hooks,
+      contractFactory: (input) => this.buildGoalContract(input),
+      config,
+    });
+    this.inbox = new AttentionInbox({
+      store: this.store,
+      tenantId: config.security.tenantId,
+      publishEvent: (event) => this.publishEvent(event),
+    });
+    this.scheduler.resourceKernel = this.resources;
     this.sensors = createBuiltinSensors();
     this.monitoring = new MonitoringService({
       store: this.store,
@@ -64,13 +105,21 @@ export class PersonalAgentSystem {
       config,
     });
     this.monitoring.ensureDefaults();
-    this.listeners = new ListenerRegistry({ eventBus: this.eventBus, store: this.store });
+    this.listeners = new ListenerRegistry({
+      eventBus: this.eventBus, store: this.store, tenantId: config.security.tenantId,
+    });
     this.listeners.register('workspace-inbox', createWorkspaceInboxListener({
       store: this.store,
       monitoring: this.monitoring,
       heartbeatMs: config.kernel.heartbeatMs,
+      tenantId: config.security.tenantId,
     }));
-    this.channels = new ChannelRegistry({ hooks: this.hooks, eventBus: this.eventBus });
+    this.channels = new ChannelRegistry({
+      hooks: this.hooks,
+      eventBus: this.eventBus,
+      store: this.store,
+      tenantId: config.security.tenantId,
+    });
     this.channels.register('web', {
       name: 'HTTP API',
       send: async (record) => ({ ok: true, local: true, outboxId: record.id }),
@@ -83,6 +132,10 @@ export class PersonalAgentSystem {
       name: 'Internal Agent-to-Agent',
       send: async (record) => ({ ok: true, internal: true, outboxId: record.id }),
     });
+    this.channels.register('webhook', {
+      name: 'Authenticated inbound webhook',
+      inbound: true,
+    });
     this.outbox = new OutboxDispatcher({ store: this.store, channels: this.channels });
     this.registerTools();
     this.registerActions();
@@ -94,6 +147,7 @@ export class PersonalAgentSystem {
       hooks: this.hooks,
       sensors: this.sensors,
       listeners: this.listeners,
+      sandboxes: this.sandboxes,
     });
     this.interrupts = new InterruptController({
       store: this.store,
@@ -101,10 +155,13 @@ export class PersonalAgentSystem {
       eventBus: this.eventBus,
       config,
     });
+    this.attention = new AttentionAllocator({ store: this.store, config });
     this.cognition = new CognitionService({
       store: this.store,
       sessions: this.sessions,
       eventBus: this.eventBus,
+      attention: this.attention,
+      interrupts: this.interrupts,
       config,
       modelAvailable: () => config.agents.some((agent) => {
         const model = config.models[agent.model];
@@ -112,12 +169,19 @@ export class PersonalAgentSystem {
           && (model.provider !== 'openai-compatible' || Boolean(model.apiKey));
       }),
     });
+    this.planRepair = new PlanRepairService({
+      store: this.store,
+      eventBus: this.eventBus,
+      sessions: this.sessions,
+      config,
+    });
     this.kernel = new KernelDaemon({
       store: this.store,
       scheduler: this.scheduler,
       housekeeping: () => this.housekeeping(),
       interrupts: this.interrupts,
       cognition: this.cognition,
+      planRepair: this.planRepair,
       listeners: this.listeners,
       config,
     });
@@ -129,6 +193,49 @@ export class PersonalAgentSystem {
     return this;
   }
 
+  buildGoalContract(input = {}) {
+    const parent = input.parentGoalId ? this.store.getGoalContract(input.parentGoalId) : null;
+    const agentId = input.agentId ?? parent?.agent_id ?? 'main';
+    const tenantId = input.tenantId ?? parent?.tenant_id ?? 'default';
+    if (parent && (parent.agent_id !== agentId || parent.tenant_id !== tenantId)) {
+      throw new Error('Child goals cannot cross agent or tenant ownership boundaries');
+    }
+    if (parent) {
+      const parentDepth = Number(this.store.getGoal(input.parentGoalId)?.metadata.spawnDepth ?? 0);
+      this.resources.authorizeFanOut(input.parentGoalId, 1, Number(input.spawnDepth ?? parentDepth + 1));
+    }
+    const requestedDeadline = input.deadlineAt == null ? null : new Date(input.deadlineAt).getTime();
+    if (input.deadlineAt != null && !Number.isFinite(requestedDeadline)) throw new Error('deadlineAt must be a valid date or timestamp');
+    const deadlineAt = parent?.deadline_at && requestedDeadline
+      ? Math.min(parent.deadline_at, requestedDeadline)
+      : parent?.deadline_at ?? requestedDeadline;
+    const rawCapabilityExpiry = input.capabilityExpiresAt ?? input.capabilities?.expiresAt;
+    const requestedCapabilityExpiry = rawCapabilityExpiry == null
+      ? null
+      : new Date(rawCapabilityExpiry).getTime();
+    if (rawCapabilityExpiry != null && !Number.isFinite(requestedCapabilityExpiry)) {
+      throw new Error('capabilityExpiresAt must be a valid date or timestamp');
+    }
+    const capabilities = this.capabilities.freeze({
+      parentGoalId: input.parentGoalId,
+      requested: input.capabilities,
+      expiresAt: requestedCapabilityExpiry,
+    });
+    const capabilityExpiresAt = parent?.capability_expires_at && capabilities.expiresAt
+      ? Math.min(parent.capability_expires_at, capabilities.expiresAt)
+      : parent?.capability_expires_at ?? capabilities.expiresAt ?? null;
+    return {
+      agentId,
+      tenantId,
+      parentGoalId: input.parentGoalId ?? null,
+      deadlineAt,
+      budget: this.resources.buildBudget({ parentGoalId: input.parentGoalId, requested: input.budget }),
+      capabilities,
+      capabilityExpiresAt,
+      createdBy: input.createdBy ?? 'kernel',
+    };
+  }
+
   registerTools() {
     for (const tool of createWorkspaceTools(this.store)) this.tools.register(tool);
     this.tools
@@ -136,6 +243,7 @@ export class PersonalAgentSystem {
         name: 'memory_search',
         description: 'Searches the current agent\'s long-term memory.',
         risk: 'low',
+        resourcePool: 'memory',
         parameters: {
           type: 'object',
           properties: { query: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 20 } },
@@ -144,25 +252,91 @@ export class PersonalAgentSystem {
         },
         execute: async ({ query, limit }, { session }) => ({
           ok: true,
-          memories: this.memory.recall(session.agent_id, query, { limit }),
+          memories: this.memory.recall(session.agent_id, query, { limit, tenantId: session.tenant_id }),
         }),
       })
       .register({
         name: 'memory_remember',
-        description: 'Stores a fact, preference, or decision that is useful across sessions. Never store secrets.',
+        description: 'Stores a fact, preference, or decision across sessions only when the user explicitly asks for it. Never store secrets.',
         risk: 'low',
+        resourcePool: 'memory',
+        sideEffect: { mode: 'local-idempotent' },
         parameters: {
           type: 'object',
           properties: {
             content: { type: 'string' },
-            kind: { type: 'string', enum: ['fact', 'preference', 'decision', 'note'] },
+            kind: { type: 'string', enum: ['fact', 'preference', 'decision', 'episode', 'procedure', 'note'] },
             importance: { type: 'number', minimum: 0, maximum: 1 },
+            confidence: { type: 'number', minimum: 0, maximum: 1 },
             tags: { type: 'array', items: { type: 'string' } },
+            validFrom: { type: 'number' },
+            validUntil: { type: 'number' },
+            supersedesId: { type: 'string' },
+            contradictsIds: { type: 'array', items: { type: 'string' } },
           },
           required: ['content'],
           additionalProperties: false,
         },
-        execute: async (args, { session }) => ({ ok: true, memory: this.memory.remember({ ...args, agentId: session.agent_id, source: `session:${session.id}` }) }),
+        execute: async (args, { session, idempotencyKey }) => ({ ok: true, memory: this.memory.remember({
+          ...args,
+          id: `memory:${idempotencyKey}`,
+          agentId: session.agent_id,
+          tenantId: session.tenant_id,
+          source: `session:${session.id}`,
+          provenance: { sessionId: session.id, channel: session.channel, peerKey: session.peer_key },
+        }) }),
+      })
+      .register({
+        name: 'memory_confirm',
+        description: 'Confirms an existing long-term memory only after explicit user verification and raises its confidence without changing its content.',
+        risk: 'low',
+        resourcePool: 'memory',
+        sideEffect: { mode: 'local-idempotent' },
+        parameters: {
+          type: 'object',
+          properties: {
+            memoryId: { type: 'string' },
+            confidence: { type: 'number', minimum: 0, maximum: 1 },
+          },
+          required: ['memoryId'],
+          additionalProperties: false,
+        },
+        execute: async ({ memoryId, confidence }, { session }) => {
+          const memory = this.store.getMemory(memoryId);
+          if (!memory || memory.agent_id !== session.agent_id || memory.tenant_id !== session.tenant_id) {
+            return { ok: false, error: 'Memory is unavailable in this agent scope' };
+          }
+          return { ok: true, memory: this.memory.confirm(memoryId, { confidence, source: `session:${session.id}` }) };
+        },
+      })
+      .register({
+        name: 'plan_assume',
+        description: 'Records an explicit, falsifiable planning assumption and the durable event that should invalidate it.',
+        risk: 'low',
+        resourcePool: 'default',
+        sideEffect: { mode: 'local-idempotent' },
+        parameters: {
+          type: 'object',
+          properties: {
+            statement: { type: 'string' },
+            confidence: { type: 'number', minimum: 0, maximum: 1 },
+            watchTopic: { type: 'string' },
+            correlationKey: { type: 'string' },
+            source: { type: 'string' },
+          },
+          required: ['statement', 'watchTopic'],
+          additionalProperties: false,
+        },
+        execute: async (args, { task, idempotencyKey }) => ({
+          ok: true,
+          assumption: this.store.addGoalAssumption(task.goal_id, {
+            id: `assumption:${idempotencyKey}`,
+            statement: args.statement,
+            confidence: args.confidence,
+            watch: { topic: args.watchTopic, correlationKey: args.correlationKey, source: args.source },
+            evidence: { recordedByTaskId: task.id },
+          }),
+        }),
       })
       .register({
         name: 'request_user_input',
@@ -216,6 +390,43 @@ export class PersonalAgentSystem {
         },
       })
       .register({
+        name: 'wait_for_channel',
+        description: 'Suspends until a continuously supervised inbound channel receives a matching message.',
+        risk: 'low',
+        resourcePool: 'default',
+        capability: { accountType: 'channel', accountArg: 'accountId' },
+        parameters: {
+          type: 'object',
+          properties: {
+            channel: { type: 'string' },
+            accountId: { type: 'string' },
+            threadKey: { type: 'string' },
+            reason: { type: 'string' },
+            timeoutSeconds: { type: 'integer', minimum: 1, maximum: 2_592_000 },
+          },
+          required: ['channel', 'accountId', 'threadKey'],
+          additionalProperties: false,
+        },
+        execute: async (args, context) => {
+          if (context.resumeEvent) return ActionControl.value({
+            ok: true,
+            message: context.resumeEvent.payload,
+          });
+          if (!this.channels.has(args.channel)) throw new Error(`Unknown channel: ${args.channel}`);
+          return ActionControl.wait({
+            kind: 'event',
+            topic: 'channel.message',
+            correlationKey: this.channels.correlationKey(args.channel, args.accountId, args.threadKey),
+            deadline: Date.now() + Number(args.timeoutSeconds ?? 86_400) * 1000,
+            reason: args.reason ?? `Waiting for ${args.channel}:${args.accountId}:${args.threadKey}`,
+          }, {
+            channel: args.channel,
+            accountId: args.accountId,
+            threadKey: args.threadKey,
+          });
+        },
+      })
+      .register({
         name: 'sleep',
         description: 'Suspends the current task for a duration without holding a worker.',
         risk: 'low',
@@ -237,6 +448,7 @@ export class PersonalAgentSystem {
         name: 'schedule_goal',
         description: 'Creates a one-time or fixed-interval personal goal.',
         risk: 'medium',
+        sideEffect: { mode: 'local-idempotent' },
         parameters: {
           type: 'object',
           properties: {
@@ -246,17 +458,19 @@ export class PersonalAgentSystem {
           required: ['name', 'objective', 'runAt'],
           additionalProperties: false,
         },
-        execute: async (args, { session }) => {
+        execute: async (args, { session, task, idempotencyKey }) => {
           const nextRunAt = new Date(args.runAt).getTime();
           if (!Number.isFinite(nextRunAt)) throw new Error('runAt must be a valid ISO date/time');
           return {
             ok: true,
             schedule: this.store.createSchedule({
+              id: `schedule:${idempotencyKey}`,
               agentId: session.agent_id,
+              tenantId: session.tenant_id,
               name: args.name,
               nextRunAt,
               intervalMs: args.intervalMinutes ? args.intervalMinutes * 60_000 : null,
-              payload: { objective: args.objective, sessionId: session.id },
+              payload: { objective: args.objective, sessionId: session.id, parentGoalId: task.goal_id },
             }),
           };
         },
@@ -291,13 +505,14 @@ export class PersonalAgentSystem {
         },
         execute: async (args, context) => {
           const depth = Number(context.session.metadata.spawnDepth ?? 0);
-          if (depth >= 2) throw new Error('Maximum child-goal depth reached');
           let childGoalIds = context.toolState?.childGoalIds;
           if (!childGoalIds) {
+            this.resources.authorizeFanOut(context.task.goal_id, args.goals.length, depth + 1);
             const children = [];
             for (const [index, goal] of args.goals.entries()) {
               const accepted = await this.sessions.submit({
                 agentId: context.session.agent_id,
+                tenantId: context.session.tenant_id,
                 channel: 'internal',
                 peerKey: `parent:${context.task.goal_id}`,
                 threadKey: `${context.task.id}:${index}`,
@@ -330,18 +545,25 @@ export class PersonalAgentSystem {
         name: 'memory_forget',
         description: 'Permanently deletes a long-term memory. This action cannot be undone.',
         risk: 'high',
+        resourcePool: 'isolated-side-effects',
+        sideEffect: { mode: 'non-idempotent' },
         parameters: {
           type: 'object',
           properties: { memoryId: { type: 'string' }, reason: { type: 'string' } },
           required: ['memoryId', 'reason'],
           additionalProperties: false,
         },
-        execute: async ({ memoryId }) => ({ ok: this.store.deleteMemory(memoryId) }),
+        execute: async ({ memoryId }, { session }) => ({
+          ok: Boolean(this.memory.forget(memoryId, {
+            agentId: session.agent_id, tenantId: session.tenant_id,
+          })),
+        }),
       })
       .register({
         name: 'create_monitor',
         description: 'Creates a persistent background monitor that keeps sensing while the agent is idle.',
         risk: 'medium',
+        sideEffect: { mode: 'local-idempotent' },
         parameters: {
           type: 'object',
           properties: {
@@ -354,10 +576,12 @@ export class PersonalAgentSystem {
           required: ['name', 'sensorType', 'intervalSeconds', 'config'],
           additionalProperties: false,
         },
-        execute: async (args, { session }) => ({
+        execute: async (args, { session, idempotencyKey }) => ({
           ok: true,
           monitor: this.store.createMonitor({
+            id: `monitor:${idempotencyKey}`,
             agentId: session.agent_id,
+            tenantId: session.tenant_id,
             name: args.name,
             sensorType: args.sensorType,
             intervalMs: args.intervalSeconds * 1000,
@@ -372,7 +596,7 @@ export class PersonalAgentSystem {
         parameters: { type: 'object', properties: {}, additionalProperties: false },
         execute: async (_args, { session }) => ({
           ok: true,
-          monitors: this.store.listMonitors({ agentId: session.agent_id }).map((monitor) => ({
+          monitors: this.store.listMonitors({ agentId: session.agent_id, tenantId: session.tenant_id }).map((monitor) => ({
             id: monitor.id,
             name: monitor.name,
             sensorType: monitor.sensor_type,
@@ -396,6 +620,17 @@ export class PersonalAgentSystem {
           interrupts: this.store.listInterrupts({ status: 'PENDING', limit: 20 }),
           cognition: this.cognition.status(),
         }),
+      })
+      .register({
+        name: 'goal_contract',
+        description: 'Reports the current goal deadline, remaining budget, frozen capabilities, and capability status.',
+        risk: 'low',
+        parameters: { type: 'object', properties: {}, additionalProperties: false },
+        execute: async (_args, context) => ({
+          ok: true,
+          contract: this.store.getGoalContract(context.task.goal_id),
+          resourcePools: this.resourcePools.status(),
+        }),
       });
   }
 
@@ -403,7 +638,7 @@ export class PersonalAgentSystem {
     this.actions
       .register('personal.recall', async ({ sessionId, query }) => {
         const session = this.store.getSession(sessionId);
-        return { memories: this.memory.recall(session.agent_id, query) };
+        return { memories: this.memory.recall(session.agent_id, query, { tenantId: session.tenant_id }) };
       })
       .register('personal.agent_turn', (input, context) => this.agentTurn.run(input, context))
       .register('personal.deliver', async ({ sessionId }, context) => {
@@ -411,21 +646,20 @@ export class PersonalAgentSystem {
         const source = context.task.dependsOn.map((id) => this.store.getTask(id)).find((task) => task?.kind === 'agent-turn');
         const response = source?.result;
         if (!response?.text) throw new Error('Agent turn produced no deliverable text');
-        const message = this.store.appendMessage({
+        const delivery = this.store.appendMessageAndEnqueueOutbox({
           id: `assistant:${source.id}`,
           sessionId: session.id,
           role: 'assistant',
           content: { text: response.text, usage: response.usage, trace: response.trace },
           runId: source.id,
           provenance: 'agent',
-        });
-        const outbox = this.store.enqueueOutbox({
-          sessionId: session.id,
+        }, {
           channel: session.channel,
           target: session.peer_key,
-          payload: { type: 'assistant.message', messageId: message.id, text: response.text },
+          payload: { type: 'assistant.message', messageId: `assistant:${source.id}`, text: response.text },
           idempotencyKey: `delivery:${context.task.id}`,
         });
+        const { message, outbox } = delivery;
         return { messageId: message.id, outboxId: outbox.id };
       });
   }
@@ -444,16 +678,21 @@ export class PersonalAgentSystem {
 
   async runHousekeeping() {
     this.monitoring.tick();
+    this.channels.reconcileInbound();
+    await this.operations.reconcileDue();
     await this.outbox.drain();
-    for (const schedule of this.store.getDueSchedules()) {
+    for (const schedule of this.store.getDueSchedules(20, this.config.security.tenantId)) {
       try {
         const session = (schedule.payload.sessionId ? this.store.getSession(schedule.payload.sessionId) : null)
-          ?? this.sessions.getOrCreate({ agentId: schedule.agent_id, channel: 'terminal', peerKey: 'owner' });
+          ?? this.sessions.getOrCreate({
+            agentId: schedule.agent_id, tenantId: schedule.tenant_id, channel: 'terminal', peerKey: 'owner',
+          });
         const result = await this.sessions.submit({
           sessionKey: session.session_key,
           text: schedule.payload.objective,
           messageId: `schedule:${schedule.id}:${schedule.next_run_at}`,
           provenance: `schedule:${schedule.id}`,
+          parentGoalId: schedule.payload.parentGoalId,
         });
         this.store.markScheduleRun(schedule.id, result.goal.id);
       } catch (error) {
@@ -484,7 +723,17 @@ export class PersonalAgentSystem {
   }
 
   async createGoal(objective, options = {}) {
-    const view = await this.runtime.createGoal(objective, options);
+    const contract = this.buildGoalContract({
+      agentId: options.agentId ?? 'main',
+      tenantId: options.tenantId ?? this.config.security.tenantId,
+      parentGoalId: options.parentGoalId,
+      deadlineAt: options.deadlineAt,
+      budget: options.budget,
+      capabilities: options.capabilities,
+      capabilityExpiresAt: options.capabilityExpiresAt,
+      createdBy: options.createdBy ?? 'api',
+    });
+    const view = await this.runtime.createGoal(objective, { ...options, contract });
     const priority = Math.max(10, Math.min(100, Number(options.priority ?? 80)));
     if (options.interrupt === true || priority >= this.config.kernel.preemptionPriority) {
       this.interrupts.raise({

@@ -104,12 +104,15 @@ export class MonitoringService {
   ensureDefaults() {
     if (!this.config.sensing.enabled || !this.config.sensing.defaultInboxMonitor) return;
     for (const agent of this.store.listAgents()) {
-      const exists = this.store.listMonitors({ agentId: agent.id }).some((monitor) => (
+      const exists = this.store.listMonitors({
+        agentId: agent.id, tenantId: this.config.security.tenantId,
+      }).some((monitor) => (
         monitor.sensor_type === 'workspace_inbox' && monitor.config.systemDefault === true
       ));
       if (!exists) {
         this.store.createMonitor({
           agentId: agent.id,
+          tenantId: this.config.security.tenantId,
           name: 'Workspace inbox',
           sensorType: 'workspace_inbox',
           intervalMs: this.config.sensing.inboxPollMs,
@@ -129,7 +132,7 @@ export class MonitoringService {
     this.pulse();
     this.store.recoverExpiredMonitorLeases();
     const capacity = Math.max(0, this.config.sensing.monitorConcurrency - this.active.size);
-    for (const candidate of this.store.getDueMonitors(capacity)) {
+    for (const candidate of this.store.getDueMonitors(capacity, this.config.security.tenantId)) {
       const monitor = this.store.claimMonitor(candidate.id, this.config.runtime.leaseMs);
       if (!monitor) continue;
       const execution = this.run(monitor).finally(() => this.active.delete(monitor.id));
@@ -192,10 +195,15 @@ export class MonitoringService {
         },
         source: `monitor:${monitor.id}`,
         idempotencyKey: `monitor:${monitor.id}:revision:${completed.revision}`,
+        tenantId: monitor.tenant_id,
+        agentId: monitor.agent_id,
+        authenticated: true,
+        authSubject: `sensor:${monitor.sensor_type}`,
       });
       if (monitor.config.autoGoal) {
         const session = this.sessions.getOrCreate({
           agentId: monitor.agent_id,
+          tenantId: monitor.tenant_id,
           channel: 'internal',
           peerKey: `monitor:${monitor.id}`,
           metadata: { monitorId: monitor.id },
@@ -208,6 +216,25 @@ export class MonitoringService {
           text: objective,
           messageId: `monitor:${monitor.id}:revision:${completed.revision}`,
           provenance: `monitor:${monitor.id}`,
+          capabilities: monitor.config.capabilities ?? {
+            tools: ['memory_search', 'goal_status', 'monitor_status', 'workspace_list', 'workspace_read'],
+            resourcePools: ['default', 'memory', 'filesystem'],
+            filesystem: { roots: ['.'], operations: ['list', 'read'] },
+            network: { domains: [], methods: [] },
+            accounts: {},
+            dataScopes: ['agent:self'],
+            credentialRefs: [],
+          },
+          budget: monitor.config.budget ?? {
+            maxInputTokens: 12_000,
+            maxOutputTokens: 2_000,
+            maxCostUsd: 0.1,
+            maxToolCalls: 8,
+            maxWallTimeMs: 300_000,
+            maxContextChars: 30_000,
+            maxFanOut: 1,
+            maxDepth: 1,
+          },
         });
       }
       return event;

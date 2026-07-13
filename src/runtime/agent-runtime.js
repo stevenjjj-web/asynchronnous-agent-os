@@ -30,6 +30,12 @@ export class AgentRuntime {
 
   async createGoal(objective, options = {}) {
     const plan = await this.planner.compile(objective, options);
+    if (options.contract) {
+      plan.goal.contract = options.contract;
+      plan.goal.tenantId = options.contract.tenantId;
+      plan.goal.deadlineAt = options.contract.deadlineAt;
+      plan.goal.agentId = options.contract.agentId;
+    }
     const created = this.store.createGoalWithTasks(plan.goal, plan.tasks);
     this.eventBus.emit('change', {
       type: 'GOAL_CREATED',

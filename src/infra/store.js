@@ -53,7 +53,22 @@ function hydrateMessage(row) {
 
 function hydrateMemory(row) {
   if (!row) return null;
-  return { ...row, tags: decode(row.tags_json, []) };
+  return { ...row, tags: decode(row.tags_json, []), provenance: decode(row.provenance_json, {}) };
+}
+
+function hydratePlanVersion(row) {
+  if (!row) return null;
+  return { ...row, plan: decode(row.plan_json, {}), trigger: decode(row.trigger_json, {}) };
+}
+
+function hydrateAssumption(row) {
+  if (!row) return null;
+  return { ...row, watch: decode(row.watch_json, {}), evidence: decode(row.evidence_json, {}) };
+}
+
+function hydrateResourceClaim(row) {
+  if (!row) return null;
+  return { ...row, detail: decode(row.detail_json, {}) };
 }
 
 function hydrateApproval(row) {
@@ -67,6 +82,11 @@ function hydrateSchedule(row) {
 }
 
 function hydrateOutbox(row) {
+  if (!row) return null;
+  return { ...row, payload: decode(row.payload_json, {}) };
+}
+
+function hydrateChannelMessage(row) {
   if (!row) return null;
   return { ...row, payload: decode(row.payload_json, {}) };
 }
@@ -278,6 +298,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS schedules (
         id TEXT PRIMARY KEY,
         agent_id TEXT NOT NULL,
+        tenant_id TEXT NOT NULL DEFAULT 'default',
         name TEXT NOT NULL,
         schedule_kind TEXT NOT NULL,
         payload_json TEXT NOT NULL,
@@ -307,9 +328,33 @@ export class Store {
       );
       CREATE INDEX IF NOT EXISTS idx_outbox_due ON outbox(status, next_attempt_at);
 
+      CREATE TABLE IF NOT EXISTS channel_messages (
+        id TEXT PRIMARY KEY,
+        channel_id TEXT NOT NULL,
+        external_message_id TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        thread_key TEXT NOT NULL,
+        sender TEXT,
+        text TEXT,
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        tenant_id TEXT NOT NULL DEFAULT 'default',
+        agent_id TEXT NOT NULL DEFAULT 'main',
+        status TEXT NOT NULL DEFAULT 'PENDING',
+        event_id TEXT REFERENCES events(id) ON DELETE SET NULL,
+        received_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        delivered_at INTEGER,
+        UNIQUE(channel_id, account_id, external_message_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_channel_messages_pending
+        ON channel_messages(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_channel_messages_thread
+        ON channel_messages(channel_id, account_id, thread_key, received_at DESC);
+
       CREATE TABLE IF NOT EXISTS monitors (
         id TEXT PRIMARY KEY,
         agent_id TEXT NOT NULL,
+        tenant_id TEXT NOT NULL DEFAULT 'default',
         name TEXT NOT NULL,
         sensor_type TEXT NOT NULL,
         config_json TEXT NOT NULL,
@@ -408,6 +453,49 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_goal_contracts_deadline
         ON goal_contracts(deadline_at, capability_status);
 
+      CREATE TABLE IF NOT EXISTS plan_versions (
+        id TEXT PRIMARY KEY,
+        goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+        version INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        plan_json TEXT NOT NULL,
+        trigger_json TEXT NOT NULL DEFAULT '{}',
+        created_at INTEGER NOT NULL,
+        UNIQUE(goal_id, version)
+      );
+      CREATE INDEX IF NOT EXISTS idx_plan_versions_goal
+        ON plan_versions(goal_id, version DESC);
+
+      CREATE TABLE IF NOT EXISTS goal_assumptions (
+        id TEXT PRIMARY KEY,
+        goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+        statement TEXT NOT NULL,
+        status TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        watch_json TEXT NOT NULL DEFAULT '{}',
+        evidence_json TEXT NOT NULL DEFAULT '{}',
+        invalidated_by_event_id TEXT REFERENCES events(id) ON DELETE SET NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_goal_assumptions_active
+        ON goal_assumptions(status, goal_id, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS resource_claims (
+        id TEXT PRIMARY KEY,
+        goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        scope TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        status TEXT NOT NULL,
+        owner TEXT,
+        detail_json TEXT NOT NULL DEFAULT '{}',
+        acquired_at INTEGER NOT NULL,
+        released_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_resource_claims_held
+        ON resource_claims(scope, status, acquired_at);
+
       CREATE TABLE IF NOT EXISTS resource_usage_ledger (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         idempotency_key TEXT UNIQUE,
@@ -473,6 +561,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS attention_assessments (
         id TEXT PRIMARY KEY,
         agent_id TEXT NOT NULL,
+        tenant_id TEXT NOT NULL DEFAULT 'default',
         score REAL NOT NULL,
         expected_value REAL NOT NULL,
         estimated_cost REAL NOT NULL,
@@ -507,7 +596,21 @@ export class Store {
     this.ensureColumn('events', 'authenticated', 'INTEGER NOT NULL DEFAULT 0');
     this.ensureColumn('events', 'auth_subject', 'TEXT');
     this.ensureColumn('sessions', 'tenant_id', "TEXT NOT NULL DEFAULT 'default'");
+    this.ensureColumn('memories', 'tenant_id', "TEXT NOT NULL DEFAULT 'default'");
+    this.ensureColumn('memories', 'confidence', 'REAL NOT NULL DEFAULT 0.7');
+    this.ensureColumn('memories', 'status', "TEXT NOT NULL DEFAULT 'ACTIVE'");
+    this.ensureColumn('memories', 'valid_from', 'INTEGER');
+    this.ensureColumn('memories', 'valid_until', 'INTEGER');
+    this.ensureColumn('memories', 'provenance_json', "TEXT NOT NULL DEFAULT '{}'");
+    this.ensureColumn('memories', 'supersedes_id', 'TEXT');
+    this.ensureColumn('memories', 'contradiction_group', 'TEXT');
+    this.ensureColumn('memories', 'last_confirmed_at', 'INTEGER');
+    this.ensureColumn('memories', 'access_count', 'INTEGER NOT NULL DEFAULT 0');
+    this.ensureColumn('schedules', 'tenant_id', "TEXT NOT NULL DEFAULT 'default'");
+    this.ensureColumn('monitors', 'tenant_id', "TEXT NOT NULL DEFAULT 'default'");
+    this.ensureColumn('attention_assessments', 'tenant_id', "TEXT NOT NULL DEFAULT 'default'");
     this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_events_source_nonce ON events(source, nonce) WHERE nonce IS NOT NULL');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_memories_active ON memories(agent_id, tenant_id, status, valid_until, updated_at DESC)');
 
     try {
       this.db.exec(`
@@ -536,7 +639,7 @@ export class Store {
     } catch {
       this.memoryFts = false;
     }
-    this.db.exec('PRAGMA user_version = 5');
+    this.db.exec('PRAGMA user_version = 6');
   }
 
   ensureColumn(table, column, definition) {
@@ -559,6 +662,18 @@ export class Store {
   }
 
   createGoalWithTasks(goalInput, taskInputs) {
+    const semanticClaims = goalInput.metadata?.resourceClaims ?? [];
+    if (!Array.isArray(semanticClaims)) throw new Error('Goal resourceClaims must be an array');
+    if (semanticClaims.length > 64) throw new Error('A goal may declare at most 64 semantic resource claims');
+    for (const rawClaim of semanticClaims) {
+      const claim = typeof rawClaim === 'string' ? { scope: rawClaim } : rawClaim;
+      if (!claim?.scope || typeof claim.scope !== 'string' || claim.scope.length > 256) {
+        throw new Error('Every semantic resource claim requires a scope of at most 256 characters');
+      }
+      if (claim.mode && !['shared', 'exclusive', 'SHARED', 'EXCLUSIVE'].includes(claim.mode)) {
+        throw new Error(`Unsupported semantic resource claim mode: ${claim.mode}`);
+      }
+    }
     return this.transaction(() => {
       const timestamp = now();
       const goalId = goalInput.id ?? randomUUID();
@@ -585,6 +700,7 @@ export class Store {
           accounts: {},
           dataScopes: ['agent:self'],
           credentialRefs: [],
+          constraints: {},
         },
       };
       this.db.prepare(`
@@ -656,6 +772,21 @@ export class Store {
         timestamp,
       );
 
+      this.addPlanVersion(goalId, {
+        objective: goalInput.objective,
+        tasks: taskInputs.map((task) => ({
+          id: task.id,
+          title: task.title,
+          kind: task.kind ?? 'workflow',
+          priority: task.priority ?? 50,
+          dependsOn: task.dependsOn ?? [],
+          workflow: task.workflow ?? [],
+        })),
+      }, { type: 'goal-created' });
+      for (const assumption of goalInput.metadata?.assumptions ?? []) {
+        this.addGoalAssumption(goalId, assumption);
+      }
+
       this.appendAudit(goalId, null, 'GOAL_CREATED', `Goal "${goalInput.title}" was created`, { taskCount: tasks.length });
       this.appendCapabilityAudit(goalId, 'FROZEN', contract.createdBy ?? 'kernel', {
         parentGoalId: contract.parentGoalId ?? null,
@@ -675,6 +806,270 @@ export class Store {
 
   getGoalContract(goalId) {
     return hydrateGoalContract(this.db.prepare('SELECT * FROM goal_contracts WHERE goal_id = ?').get(goalId));
+  }
+
+  addPlanVersion(goalId, plan, trigger = {}, status = 'CURRENT') {
+    const version = Number(this.db.prepare('SELECT COALESCE(MAX(version), 0) AS version FROM plan_versions WHERE goal_id = ?').get(goalId).version) + 1;
+    if (status === 'CURRENT') this.db.prepare("UPDATE plan_versions SET status = 'SUPERSEDED' WHERE goal_id = ? AND status = 'CURRENT'").run(goalId);
+    const row = {
+      id: `plan:${goalId}:${version}`,
+      goalId,
+      version,
+      status,
+      plan,
+      trigger,
+      createdAt: now(),
+    };
+    this.db.prepare(`
+      INSERT INTO plan_versions(id, goal_id, version, status, plan_json, trigger_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(row.id, goalId, version, status, encode(plan), encode(trigger), row.createdAt);
+    this.appendAudit(goalId, null, 'PLAN_VERSION_CREATED', `Plan version ${version} created`, { version, trigger });
+    return this.getPlanVersion(row.id);
+  }
+
+  getPlanVersion(id) {
+    return hydratePlanVersion(this.db.prepare('SELECT * FROM plan_versions WHERE id = ?').get(id));
+  }
+
+  setPlanVersionStatus(id, status) {
+    this.db.prepare('UPDATE plan_versions SET status = ? WHERE id = ?').run(status, id);
+    return this.getPlanVersion(id);
+  }
+
+  listPlanVersions(goalId, limit = 50) {
+    return this.db.prepare('SELECT * FROM plan_versions WHERE goal_id = ? ORDER BY version DESC LIMIT ?')
+      .all(goalId, limit).map(hydratePlanVersion);
+  }
+
+  injectCognitiveNotice(goalId, input) {
+    const notice = {
+      id: input.id ?? randomUUID(),
+      type: input.type ?? 'plan-revision',
+      content: String(input.content),
+      data: input.data ?? {},
+      createdAt: now(),
+    };
+    const tasks = this.listTasks(goalId).filter((task) => !['RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED'].includes(task.status));
+    for (const task of tasks) {
+      const existing = task.snapshot.cognitiveNotices ?? [];
+      if (existing.some((item) => item.id === notice.id)) continue;
+      const actionStates = { ...(task.snapshot.actionStates ?? {}) };
+      for (const [pc, state] of Object.entries(actionStates)) {
+        if (!Array.isArray(state?.messages)) continue;
+        actionStates[pc] = {
+          ...state,
+          messages: [...state.messages, {
+            role: 'system',
+            content: `<cognitive-update id="${notice.id}" type="${notice.type}">\n${notice.content}\n</cognitive-update>`,
+          }],
+        };
+      }
+      const snapshot = {
+        ...task.snapshot,
+        actionStates,
+        cognitiveNotices: [...existing, notice].slice(-20),
+      };
+      this.db.prepare(`
+        UPDATE tasks SET snapshot_json = ?, revision = revision + 1, updated_at = ?
+        WHERE id = ? AND status NOT IN ('RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED')
+      `).run(encode(snapshot), now(), task.id);
+    }
+    this.appendAudit(goalId, null, 'COGNITIVE_NOTICE_INJECTED', 'A plan revision was attached to resumable thought state', {
+      noticeId: notice.id,
+      taskIds: tasks.map((task) => task.id),
+    });
+    return notice;
+  }
+
+  addGoalAssumption(goalId, input) {
+    const timestamp = now();
+    const id = input.id ?? randomUUID();
+    const statement = String(input.statement ?? '').trim();
+    const watch = input.watch ?? {};
+    if (!statement || statement.length > 4_000) throw new Error('An assumption statement must contain 1 to 4,000 characters');
+    if (watch.topic != null && (typeof watch.topic !== 'string' || !watch.topic || watch.topic.length > 256)) {
+      throw new Error('An assumption watch topic must contain 1 to 256 characters');
+    }
+    const existing = this.getGoalAssumption(id);
+    if (existing) {
+      if (
+        existing.goal_id !== goalId
+        || existing.statement !== statement
+        || JSON.stringify(existing.watch) !== JSON.stringify(watch)
+      ) throw new Error(`Assumption id was reused with different input: ${id}`);
+      return existing;
+    }
+    this.db.prepare(`
+      INSERT INTO goal_assumptions(
+        id, goal_id, statement, status, confidence, watch_json, evidence_json,
+        invalidated_by_event_id, created_at, updated_at
+      ) VALUES (?, ?, ?, 'ACTIVE', ?, ?, ?, NULL, ?, ?)
+      ON CONFLICT(id) DO NOTHING
+    `).run(
+      id,
+      goalId,
+      statement,
+      Math.max(0, Math.min(1, Number(input.confidence ?? 0.7))),
+      encode(watch),
+      encode(input.evidence ?? {}),
+      timestamp,
+      timestamp,
+    );
+    this.appendAudit(goalId, null, 'ASSUMPTION_RECORDED', statement, { assumptionId: id, watch });
+    return this.getGoalAssumption(id);
+  }
+
+  getGoalAssumption(id) {
+    return hydrateAssumption(this.db.prepare('SELECT * FROM goal_assumptions WHERE id = ?').get(id));
+  }
+
+  listGoalAssumptions(goalId, { status, limit = 100 } = {}) {
+    return (status
+      ? this.db.prepare('SELECT * FROM goal_assumptions WHERE goal_id = ? AND status = ? ORDER BY updated_at DESC LIMIT ?').all(goalId, status, limit)
+      : this.db.prepare('SELECT * FROM goal_assumptions WHERE goal_id = ? ORDER BY updated_at DESC LIMIT ?').all(goalId, limit)
+    ).map(hydrateAssumption);
+  }
+
+  invalidateAssumptionsForEvent(eventInput) {
+    const event = typeof eventInput === 'string'
+      ? hydrateEvent(this.db.prepare('SELECT * FROM events WHERE id = ?').get(eventInput))
+      : eventInput;
+    if (!event) return [];
+    const candidates = this.db.prepare(`
+      SELECT a.* FROM goal_assumptions a
+      JOIN goals g ON g.id = a.goal_id
+      WHERE a.status = 'ACTIVE' AND g.status = 'ACTIVE'
+    `).all().map(hydrateAssumption);
+    const matches = candidates.filter((assumption) => {
+      const watch = assumption.watch ?? {};
+      const correlationKey = event.correlation_key ?? event.correlationKey;
+      const tenantId = event.tenant_id ?? event.tenantId;
+      const agentId = event.agent_id ?? event.agentId;
+      const goal = this.getGoal(assumption.goal_id);
+      if (tenantId && tenantId !== goal?.tenant_id) return false;
+      if (agentId && agentId !== goal?.agent_id) return false;
+      if (!watch.topic) return false;
+      if (watch.topic !== event.topic) return false;
+      if (watch.correlationKey && watch.correlationKey !== correlationKey) return false;
+      if (watch.source && watch.source !== event.source) return false;
+      return true;
+    });
+    const timestamp = now();
+    for (const assumption of matches) {
+      this.db.prepare(`
+        UPDATE goal_assumptions
+        SET status = 'INVALIDATED', invalidated_by_event_id = ?, updated_at = ?
+        WHERE id = ? AND status = 'ACTIVE'
+      `).run(event.id, timestamp, assumption.id);
+      this.db.prepare("UPDATE plan_versions SET status = 'STALE' WHERE goal_id = ? AND status = 'CURRENT'").run(assumption.goal_id);
+      this.appendAudit(assumption.goal_id, null, 'ASSUMPTION_INVALIDATED', assumption.statement, {
+        assumptionId: assumption.id,
+        eventId: event.id,
+        topic: event.topic,
+        correlationKey: event.correlation_key ?? event.correlationKey,
+      });
+    }
+    return matches.map((assumption) => ({
+      assumption: this.getGoalAssumption(assumption.id),
+      goal: this.getGoal(assumption.goal_id),
+      event,
+    }));
+  }
+
+  acquireResourceClaims(taskId, owner) {
+    const task = this.getTask(taskId);
+    if (!task) return { acquired: false, reason: 'Task not found' };
+    const goal = this.getGoal(task.goal_id);
+    const declared = goal?.metadata?.resourceClaims
+      ?? (goal?.metadata?.conflictKeys ?? []).map((scope) => ({ scope, mode: 'exclusive' }));
+    const byScope = new Map();
+    for (const item of declared) {
+      const claim = typeof item === 'string' ? { scope: item, mode: 'exclusive' } : item;
+      if (!claim?.scope) continue;
+      const mode = String(claim.mode ?? 'exclusive').toLowerCase() === 'shared' ? 'SHARED' : 'EXCLUSIVE';
+      if (!byScope.has(claim.scope) || mode === 'EXCLUSIVE') byScope.set(String(claim.scope), { scope: String(claim.scope), mode, detail: claim.detail ?? {} });
+    }
+    const requested = [...byScope.values()];
+    if (!requested.length) return { acquired: true, claims: [] };
+    return this.transaction(() => {
+      const conflicts = [];
+      for (const claim of requested) {
+        const held = this.db.prepare(`
+          SELECT c.* FROM resource_claims c
+          JOIN goals g ON g.id = c.goal_id
+          WHERE c.scope = ? AND c.status = 'HELD' AND c.task_id != ?
+            AND g.tenant_id = ?
+            AND (c.mode = 'EXCLUSIVE' OR ? = 'EXCLUSIVE')
+          ORDER BY c.acquired_at ASC LIMIT 1
+        `).get(claim.scope, task.id, goal.tenant_id, claim.mode);
+        if (held) conflicts.push(hydrateResourceClaim(held));
+      }
+      if (conflicts.length) return { acquired: false, conflicts, reason: `Semantic resource conflict: ${conflicts.map((claim) => claim.scope).join(', ')}` };
+      const timestamp = now();
+      const claims = requested.map((claim) => {
+        const id = randomUUID();
+        this.db.prepare(`
+          INSERT INTO resource_claims(
+            id, goal_id, task_id, scope, mode, status, owner, detail_json, acquired_at, released_at
+          ) VALUES (?, ?, ?, ?, ?, 'HELD', ?, ?, ?, NULL)
+        `).run(id, task.goal_id, task.id, claim.scope, claim.mode, owner, encode(claim.detail), timestamp);
+        return this.getResourceClaim(id);
+      });
+      this.appendAudit(task.goal_id, task.id, 'RESOURCE_CLAIMS_ACQUIRED', 'Semantic resource claims acquired', {
+        scopes: claims.map((claim) => ({ scope: claim.scope, mode: claim.mode })), owner,
+      });
+      return { acquired: true, claims };
+    });
+  }
+
+  getResourceClaim(id) {
+    return hydrateResourceClaim(this.db.prepare('SELECT * FROM resource_claims WHERE id = ?').get(id));
+  }
+
+  listResourceClaims({ taskId, goalId, status, limit = 100 } = {}) {
+    const clauses = [];
+    const params = [];
+    if (taskId) { clauses.push('task_id = ?'); params.push(taskId); }
+    if (goalId) { clauses.push('goal_id = ?'); params.push(goalId); }
+    if (status) { clauses.push('status = ?'); params.push(status); }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    return this.db.prepare(`SELECT * FROM resource_claims ${where} ORDER BY acquired_at DESC LIMIT ?`)
+      .all(...params, limit).map(hydrateResourceClaim);
+  }
+
+  releaseResourceClaims(taskId, reason = 'Execution quantum ended') {
+    const timestamp = now();
+    const held = this.listResourceClaims({ taskId, status: 'HELD', limit: 1_000 });
+    if (!held.length) return [];
+    this.db.prepare("UPDATE resource_claims SET status = 'RELEASED', released_at = ? WHERE task_id = ? AND status = 'HELD'")
+      .run(timestamp, taskId);
+    const task = this.getTask(taskId);
+    if (task) this.appendAudit(task.goal_id, task.id, 'RESOURCE_CLAIMS_RELEASED', reason, { scopes: held.map((claim) => claim.scope) });
+    return held.map((claim) => this.getResourceClaim(claim.id));
+  }
+
+  releaseStaleResourceClaims() {
+    const stale = this.db.prepare(`
+      SELECT c.* FROM resource_claims c
+      LEFT JOIN tasks t ON t.id = c.task_id
+      WHERE c.status = 'HELD' AND (t.id IS NULL OR t.status != 'RUNNING')
+    `).all().map(hydrateResourceClaim);
+    for (const claim of stale) this.releaseResourceClaims(claim.task_id, 'Recovered a stale semantic resource claim');
+    return stale.length;
+  }
+
+  updateGoalBudget(goalId, budget, actor = 'operator', reason = 'Budget revised') {
+    const contract = this.getGoalContract(goalId);
+    if (!contract) return null;
+    this.db.prepare('UPDATE goal_contracts SET budget_json = ?, updated_at = ? WHERE goal_id = ?')
+      .run(encode(budget), now(), goalId);
+    this.appendAudit(goalId, null, 'GOAL_BUDGET_REVISED', reason, {
+      actor,
+      previous: contract.budget,
+      budget,
+    });
+    return this.getGoalContract(goalId);
   }
 
   recordResourceUsage(input) {
@@ -708,6 +1103,45 @@ export class Store {
       );
       const ledger = this.db.prepare('SELECT * FROM resource_usage_ledger WHERE id = ?').get(result.lastInsertRowid);
       return { recorded: true, contract: this.getGoalContract(input.goalId), ledger: { ...ledger, metadata: decode(ledger.metadata_json, {}) } };
+    });
+  }
+
+  recordResourceUsageBatch(inputs) {
+    if (!inputs.length) return null;
+    return this.transaction(() => {
+      const goalId = inputs[0].goalId;
+      if (inputs.some((input) => input.goalId !== goalId)) {
+        throw new Error('A resource usage batch must belong to one goal');
+      }
+      const contract = this.getGoalContract(goalId);
+      if (!contract) throw new Error(`Missing goal contract: ${goalId}`);
+      const usage = { ...contract.usage };
+      for (const input of inputs) {
+        const existing = input.idempotencyKey
+          ? this.db.prepare('SELECT id FROM resource_usage_ledger WHERE idempotency_key = ?').get(input.idempotencyKey)
+          : null;
+        if (existing) continue;
+        const amount = Number(input.amount ?? 0);
+        usage[input.resourceType] = Number(usage[input.resourceType] ?? 0) + amount;
+        this.db.prepare(`
+          INSERT INTO resource_usage_ledger(
+            idempotency_key, goal_id, agent_id, tenant_id, resource_type,
+            amount, metadata_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          input.idempotencyKey ?? null,
+          goalId,
+          contract.agent_id,
+          contract.tenant_id,
+          input.resourceType,
+          amount,
+          encode(input.metadata ?? {}),
+          now(),
+        );
+      }
+      this.db.prepare('UPDATE goal_contracts SET usage_json = ?, updated_at = ? WHERE goal_id = ?')
+        .run(encode(usage), now(), goalId);
+      return this.getGoalContract(goalId);
     });
   }
 
@@ -779,6 +1213,23 @@ export class Store {
     return hydrateCredentialRef(this.db.prepare('SELECT * FROM credential_refs WHERE id = ?').get(id));
   }
 
+  listCredentialRefs({ tenantId = 'default', agentId, status, limit = 100 } = {}) {
+    const clauses = ['tenant_id = ?'];
+    const params = [tenantId];
+    if (agentId) {
+      clauses.push('agent_id = ?');
+      params.push(agentId);
+    }
+    if (status) {
+      clauses.push('status = ?');
+      params.push(status);
+    }
+    return this.db.prepare(`
+      SELECT * FROM credential_refs WHERE ${clauses.join(' AND ')}
+      ORDER BY created_at DESC LIMIT ?
+    `).all(...params, limit).map(hydrateCredentialRef);
+  }
+
   setCredentialRefStatus(id, status) {
     this.db.prepare('UPDATE credential_refs SET status = ?, updated_at = ? WHERE id = ?').run(status, now(), id);
     return this.getCredentialRef(id);
@@ -786,6 +1237,21 @@ export class Store {
 
   getTask(id) {
     return hydrateTask(this.db.prepare('SELECT * FROM tasks WHERE id = ?').get(id));
+  }
+
+  updateTaskPriority(id, priority, actor = 'operator', reason = 'Priority revised') {
+    const task = this.getTask(id);
+    if (!task) return null;
+    const bounded = Math.max(0, Math.min(100, Math.round(Number(priority))));
+    if (!Number.isFinite(bounded)) throw new Error('Task priority must be a finite number');
+    this.db.prepare('UPDATE tasks SET priority = ?, revision = revision + 1, updated_at = ? WHERE id = ?')
+      .run(bounded, now(), id);
+    this.appendAudit(task.goal_id, id, 'TASK_PRIORITY_REVISED', reason, {
+      actor,
+      previousPriority: task.priority,
+      priority: bounded,
+    });
+    return this.getTask(id);
   }
 
   listTasks(goalId) {
@@ -816,6 +1282,7 @@ export class Store {
     if (!goal) return null;
     return {
       goal,
+      contract: this.getGoalContract(id),
       tasks: this.listTasks(id),
       audit: this.db.prepare(`
         SELECT * FROM audit_log WHERE goal_id = ? ORDER BY id DESC LIMIT 120
@@ -880,6 +1347,17 @@ export class Store {
     `).run(TaskStatus.READY, encode(snapshot), now(), now(), id, TaskStatus.RUNNING, leaseToken, leaseToken);
     if (!updated.changes) return this.getTask(id);
     this.appendAudit(task.goal_id, id, 'TASK_YIELDED', reason, { pc: snapshot.pc });
+    return this.getTask(id);
+  }
+
+  deferReadyTask(id, nextRunAt, reason, detail = {}) {
+    const task = this.getTask(id);
+    if (!task || task.status !== TaskStatus.READY) return task;
+    this.db.prepare(`
+      UPDATE tasks SET next_run_at = ?, last_error = ?, revision = revision + 1, updated_at = ?
+      WHERE id = ? AND status = ?
+    `).run(nextRunAt, reason, now(), id, TaskStatus.READY);
+    this.appendAudit(task.goal_id, id, 'TASK_RESOURCE_DEFERRED', reason, { nextRunAt, ...detail });
     return this.getTask(id);
   }
 
@@ -1094,12 +1572,15 @@ export class Store {
   consumeQueuedEvent(taskId, topic, correlationKey) {
     const task = this.getTask(taskId);
     if (!task) return null;
+    const goal = this.getGoal(task.goal_id);
     const row = this.db.prepare(`
       SELECT e.* FROM events e
       LEFT JOIN event_deliveries d ON d.event_id = e.id AND d.task_id = ?
       WHERE e.topic = ? AND e.correlation_key = ? AND e.created_at >= ? AND d.event_id IS NULL
+        AND (e.tenant_id IS NULL OR e.tenant_id = ?)
+        AND (e.agent_id IS NULL OR e.agent_id = ?)
       ORDER BY e.created_at ASC LIMIT 1
-    `).get(taskId, topic, correlationKey, task.created_at);
+    `).get(taskId, topic, correlationKey, task.created_at, goal?.tenant_id, goal?.agent_id);
     if (!row) return null;
     return hydrateEvent(row);
   }
@@ -1406,11 +1887,72 @@ export class Store {
     `).get(idOrKey, idOrKey));
   }
 
-  listSessions({ agentId, limit = 50 } = {}) {
-    const rows = agentId
-      ? this.db.prepare('SELECT * FROM sessions WHERE agent_id = ? ORDER BY updated_at DESC LIMIT ?').all(agentId, limit)
-      : this.db.prepare('SELECT * FROM sessions ORDER BY updated_at DESC LIMIT ?').all(limit);
-    return rows.map(hydrateSession);
+  listSessions({ agentId, tenantId, limit = 50 } = {}) {
+    const clauses = [];
+    const params = [];
+    if (agentId) {
+      clauses.push('agent_id = ?');
+      params.push(agentId);
+    }
+    if (tenantId) {
+      clauses.push('tenant_id = ?');
+      params.push(tenantId);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    return this.db.prepare(`
+      SELECT * FROM sessions ${where} ORDER BY updated_at DESC LIMIT ?
+    `).all(...params, limit).map(hydrateSession);
+  }
+
+  updateSessionMetadata(idOrKey, patch) {
+    const session = this.getSession(idOrKey);
+    if (!session) return null;
+    const metadata = { ...session.metadata, ...patch };
+    const timestamp = now();
+    this.db.prepare(`
+      UPDATE sessions
+      SET metadata_json = ?, updated_at = ?
+      WHERE id = ?
+    `).run(encode(metadata), timestamp, session.id);
+    return this.getSession(session.id);
+  }
+
+  purgeSession(idOrKey) {
+    return this.transaction(() => {
+      const session = this.getSession(idOrKey);
+      if (!session) return null;
+      const active = this.db.prepare(`
+        SELECT COUNT(*) AS count FROM goals WHERE session_id = ? AND status = 'ACTIVE'
+      `).get(session.id).count;
+      if (active > 0) throw new Error('A session with active goals cannot be purged');
+      const goalCount = this.db.prepare('SELECT COUNT(*) AS count FROM goals WHERE session_id = ?').get(session.id).count;
+      const messageCount = this.db.prepare('SELECT COUNT(*) AS count FROM messages WHERE session_id = ?').get(session.id).count;
+      const outboxCount = this.db.prepare('SELECT COUNT(*) AS count FROM outbox WHERE session_id = ?').get(session.id).count;
+      const schedules = this.listSchedules(10_000, session.tenant_id).filter((schedule) => schedule.payload.sessionId === session.id);
+      for (const schedule of schedules) {
+        const payload = { ...schedule.payload };
+        delete payload.sessionId;
+        delete payload.parentGoalId;
+        this.db.prepare('UPDATE schedules SET payload_json = ?, updated_at = ? WHERE id = ?')
+          .run(encode(payload), now(), schedule.id);
+      }
+      this.db.prepare('DELETE FROM outbox WHERE session_id = ?').run(session.id);
+      this.db.prepare(`
+        DELETE FROM interrupts
+        WHERE goal_id IN (SELECT id FROM goals WHERE session_id = ?)
+           OR target_task_id IN (SELECT id FROM tasks WHERE session_id = ?)
+           OR dispatched_task_id IN (SELECT id FROM tasks WHERE session_id = ?)
+      `).run(session.id, session.id, session.id);
+      this.db.prepare('DELETE FROM goals WHERE session_id = ?').run(session.id);
+      this.db.prepare('DELETE FROM sessions WHERE id = ?').run(session.id);
+      return {
+        session,
+        deletedGoals: Number(goalCount),
+        deletedMessages: Number(messageCount),
+        deletedOutbox: Number(outboxCount),
+        detachedSchedules: schedules.length,
+      };
+    });
   }
 
   appendMessage(input) {
@@ -1523,68 +2065,142 @@ export class Store {
   }
 
   addMemory(input) {
-    const timestamp = now();
-    const id = input.id ?? randomUUID();
-    this.db.prepare(`
-      INSERT INTO memories(
-        id, agent_id, kind, content, source, importance, tags_json, expires_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      id,
-      input.agentId ?? 'main',
-      input.kind ?? 'fact',
-      input.content,
-      input.source ?? 'agent',
-      Math.max(0, Math.min(1, Number(input.importance ?? 0.5))),
-      encode(input.tags ?? []),
-      input.expiresAt ?? null,
-      timestamp,
-      timestamp,
-    );
-    return hydrateMemory(this.db.prepare('SELECT * FROM memories WHERE id = ?').get(id));
+    return this.transaction(() => {
+      const timestamp = now();
+      const id = input.id ?? randomUUID();
+      const agentId = input.agentId ?? 'main';
+      const tenantId = input.tenantId ?? 'default';
+      const superseded = input.supersedesId ? this.getMemory(input.supersedesId) : null;
+      if (input.supersedesId && (!superseded || superseded.agent_id !== agentId || superseded.tenant_id !== tenantId)) {
+        throw new Error(`Superseded memory is unavailable: ${input.supersedesId}`);
+      }
+      this.db.prepare(`
+        INSERT INTO memories(
+          id, agent_id, tenant_id, kind, content, source, importance, confidence,
+          status, tags_json, expires_at, valid_from, valid_until, provenance_json,
+          supersedes_id, contradiction_group, last_confirmed_at, access_count,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+      `).run(
+        id,
+        agentId,
+        tenantId,
+        input.kind ?? 'fact',
+        input.content,
+        input.source ?? 'agent',
+        Math.max(0, Math.min(1, Number(input.importance ?? 0.5))),
+        Math.max(0, Math.min(1, Number(input.confidence ?? 0.7))),
+        encode(input.tags ?? []),
+        input.expiresAt ?? null,
+        input.validFrom ?? timestamp,
+        input.validUntil ?? null,
+        encode(input.provenance ?? {}),
+        input.supersedesId ?? null,
+        input.contradictionGroup ?? superseded?.contradiction_group ?? (input.supersedesId ? `memory-chain:${input.supersedesId}` : null),
+        input.lastConfirmedAt ?? timestamp,
+        timestamp,
+        timestamp,
+      );
+      if (superseded) {
+        this.db.prepare("UPDATE memories SET status = 'SUPERSEDED', updated_at = ? WHERE id = ?").run(timestamp, superseded.id);
+      }
+      for (const contradictedId of input.contradictsIds ?? []) {
+        const contradicted = this.getMemory(contradictedId);
+        if (!contradicted || contradicted.agent_id !== agentId || contradicted.tenant_id !== tenantId) {
+          throw new Error(`Contradicted memory is unavailable: ${contradictedId}`);
+        }
+        const group = input.contradictionGroup ?? contradicted.contradiction_group ?? `memory-conflict:${contradictedId}`;
+        this.db.prepare("UPDATE memories SET status = 'CONTRADICTED', contradiction_group = ?, updated_at = ? WHERE id = ?")
+          .run(group, timestamp, contradictedId);
+        this.db.prepare('UPDATE memories SET contradiction_group = ? WHERE id = ?').run(group, id);
+      }
+      return this.getMemory(id);
+    });
   }
 
   getMemory(id) {
     return hydrateMemory(this.db.prepare('SELECT * FROM memories WHERE id = ?').get(id));
   }
 
-  searchMemories(agentId, query, { limit = 8 } = {}) {
+  recordMemoryRecall(memories) {
+    if (!memories.length) return memories;
+    const update = this.db.prepare('UPDATE memories SET access_count = access_count + 1 WHERE id = ?');
+    for (const memory of memories) update.run(memory.id);
+    return memories.map((memory) => ({ ...memory, access_count: Number(memory.access_count ?? 0) + 1 }));
+  }
+
+  searchMemories(agentId, query, { limit = 8, tenantId = 'default' } = {}) {
     const timestamp = now();
     const terms = String(query ?? '').trim().split(/\s+/u).filter(Boolean).slice(0, 12);
     if (!terms.length) {
-      return this.db.prepare(`
+      return this.recordMemoryRecall(this.db.prepare(`
         SELECT * FROM memories
-        WHERE agent_id = ? AND (expires_at IS NULL OR expires_at > ?)
-        ORDER BY importance DESC, updated_at DESC LIMIT ?
-      `).all(agentId, timestamp, limit).map(hydrateMemory);
+        WHERE agent_id = ? AND tenant_id = ? AND status = 'ACTIVE'
+          AND (expires_at IS NULL OR expires_at > ?)
+          AND (valid_from IS NULL OR valid_from <= ?)
+          AND (valid_until IS NULL OR valid_until > ?)
+        ORDER BY (importance * confidence) DESC, updated_at DESC LIMIT ?
+      `).all(agentId, tenantId, timestamp, timestamp, timestamp, limit).map(hydrateMemory));
     }
     if (this.memoryFts) {
       const ftsQuery = terms.map((term) => `"${term.replaceAll('"', '""')}"`).join(' OR ');
       try {
-        return this.db.prepare(`
+        return this.recordMemoryRecall(this.db.prepare(`
           SELECT m.*, bm25(memory_fts) AS search_rank
           FROM memory_fts JOIN memories m ON m.rowid = memory_fts.rowid
-          WHERE memory_fts MATCH ? AND m.agent_id = ?
+          WHERE memory_fts MATCH ? AND m.agent_id = ? AND m.tenant_id = ?
+            AND m.status = 'ACTIVE'
             AND (m.expires_at IS NULL OR m.expires_at > ?)
-          ORDER BY search_rank ASC, m.importance DESC LIMIT ?
-        `).all(ftsQuery, agentId, timestamp, limit).map(hydrateMemory);
+            AND (m.valid_from IS NULL OR m.valid_from <= ?)
+            AND (m.valid_until IS NULL OR m.valid_until > ?)
+          ORDER BY search_rank ASC, (m.importance * m.confidence) DESC LIMIT ?
+        `).all(ftsQuery, agentId, tenantId, timestamp, timestamp, timestamp, limit).map(hydrateMemory));
       } catch {
         // Fall through to a conservative substring search for malformed FTS input.
       }
     }
     const conditions = terms.map(() => '(LOWER(content) LIKE LOWER(?) OR LOWER(tags_json) LIKE LOWER(?))').join(' OR ');
     const patterns = terms.flatMap((term) => [`%${term}%`, `%${term}%`]);
-    return this.db.prepare(`
+    return this.recordMemoryRecall(this.db.prepare(`
       SELECT * FROM memories
-      WHERE agent_id = ? AND (${conditions}) AND (expires_at IS NULL OR expires_at > ?)
-      ORDER BY importance DESC, updated_at DESC LIMIT ?
-    `).all(agentId, ...patterns, timestamp, limit).map(hydrateMemory);
+      WHERE agent_id = ? AND tenant_id = ? AND status = 'ACTIVE' AND (${conditions})
+        AND (expires_at IS NULL OR expires_at > ?)
+        AND (valid_from IS NULL OR valid_from <= ?)
+        AND (valid_until IS NULL OR valid_until > ?)
+      ORDER BY (importance * confidence) DESC, updated_at DESC LIMIT ?
+    `).all(agentId, tenantId, ...patterns, timestamp, timestamp, timestamp, limit).map(hydrateMemory));
   }
 
-  listMemories(agentId = 'main', limit = 50) {
+  listMemories(agentId = 'main', limit = 50, tenantId = 'default') {
     return this.db.prepare(`
-      SELECT * FROM memories WHERE agent_id = ? ORDER BY updated_at DESC LIMIT ?
-    `).all(agentId, limit).map(hydrateMemory);
+      SELECT * FROM memories WHERE agent_id = ? AND tenant_id = ? ORDER BY updated_at DESC LIMIT ?
+    `).all(agentId, tenantId, limit).map(hydrateMemory);
+  }
+
+  setMemoryStatus(id, status, detail = {}) {
+    const memory = this.getMemory(id);
+    if (!memory) return null;
+    this.db.prepare('UPDATE memories SET status = ?, provenance_json = ?, updated_at = ? WHERE id = ?')
+      .run(status, encode({ ...memory.provenance, statusDetail: detail }), now(), id);
+    return this.getMemory(id);
+  }
+
+  confirmMemory(id, { confidence, source } = {}) {
+    const memory = this.getMemory(id);
+    if (!memory) return null;
+    const timestamp = now();
+    this.db.prepare(`
+      UPDATE memories
+      SET confidence = ?, last_confirmed_at = ?, provenance_json = ?, updated_at = ?
+      WHERE id = ?
+    `).run(
+      Math.max(memory.confidence, Math.min(1, Number(confidence ?? memory.confidence))),
+      timestamp,
+      encode({ ...memory.provenance, lastConfirmationSource: source ?? 'operator' }),
+      timestamp,
+      id,
+    );
+    return this.getMemory(id);
   }
 
   deleteMemory(id) {
@@ -1635,14 +2251,30 @@ export class Store {
   createSchedule(input) {
     const timestamp = now();
     const id = input.id ?? randomUUID();
+    const existing = this.getSchedule(id);
+    if (existing) {
+      const expectedKind = input.kind ?? (input.intervalMs ? 'INTERVAL' : 'ONCE');
+      if (
+        existing.agent_id !== (input.agentId ?? 'main')
+        || existing.tenant_id !== (input.tenantId ?? 'default')
+        || existing.name !== input.name
+        || existing.schedule_kind !== expectedKind
+        || existing.next_run_at !== input.nextRunAt
+        || JSON.stringify(existing.payload) !== JSON.stringify(input.payload ?? {})
+      ) {
+        throw new Error(`Schedule id was reused with different input: ${id}`);
+      }
+      return existing;
+    }
     this.db.prepare(`
       INSERT INTO schedules(
-        id, agent_id, name, schedule_kind, payload_json, interval_ms, next_run_at,
+        id, agent_id, tenant_id, name, schedule_kind, payload_json, interval_ms, next_run_at,
         enabled, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       input.agentId ?? 'main',
+      input.tenantId ?? 'default',
       input.name,
       input.kind ?? (input.intervalMs ? 'INTERVAL' : 'ONCE'),
       encode(input.payload ?? {}),
@@ -1659,14 +2291,23 @@ export class Store {
     return hydrateSchedule(this.db.prepare('SELECT * FROM schedules WHERE id = ?').get(id));
   }
 
-  listSchedules(limit = 100) {
-    return this.db.prepare('SELECT * FROM schedules ORDER BY next_run_at ASC LIMIT ?').all(limit).map(hydrateSchedule);
+  listSchedules(limit = 100, tenantId) {
+    const rows = tenantId
+      ? this.db.prepare('SELECT * FROM schedules WHERE tenant_id = ? ORDER BY next_run_at ASC LIMIT ?').all(tenantId, limit)
+      : this.db.prepare('SELECT * FROM schedules ORDER BY next_run_at ASC LIMIT ?').all(limit);
+    return rows.map(hydrateSchedule);
   }
 
-  getDueSchedules(limit = 20) {
-    return this.db.prepare(`
-      SELECT * FROM schedules WHERE enabled = 1 AND next_run_at <= ? ORDER BY next_run_at ASC LIMIT ?
-    `).all(now(), limit).map(hydrateSchedule);
+  getDueSchedules(limit = 20, tenantId) {
+    const rows = tenantId
+      ? this.db.prepare(`
+          SELECT * FROM schedules WHERE enabled = 1 AND tenant_id = ? AND next_run_at <= ?
+          ORDER BY next_run_at ASC LIMIT ?
+        `).all(tenantId, now(), limit)
+      : this.db.prepare(`
+          SELECT * FROM schedules WHERE enabled = 1 AND next_run_at <= ? ORDER BY next_run_at ASC LIMIT ?
+        `).all(now(), limit);
+    return rows.map(hydrateSchedule);
   }
 
   markScheduleRun(id, goalId) {
@@ -1700,6 +2341,86 @@ export class Store {
       ) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)
     `).run(id, input.sessionId ?? null, input.channel, input.target, encode(input.payload), timestamp, input.idempotencyKey ?? null, timestamp);
     return hydrateOutbox(this.db.prepare('SELECT * FROM outbox WHERE id = ?').get(id));
+  }
+
+  recordChannelMessage(input) {
+    const existing = this.db.prepare(`
+      SELECT * FROM channel_messages
+      WHERE channel_id = ? AND account_id = ? AND external_message_id = ?
+    `).get(input.channelId, input.accountId, input.messageId);
+    if (existing) {
+      const message = hydrateChannelMessage(existing);
+      if (
+        message.thread_key !== input.threadKey
+        || message.sender !== (input.sender ?? null)
+        || message.text !== (input.text ?? null)
+        || JSON.stringify(message.payload) !== JSON.stringify(input.payload ?? {})
+      ) {
+        throw new Error(`Channel message id was reused with different content: ${input.messageId}`);
+      }
+      return { message, duplicate: true };
+    }
+    const timestamp = now();
+    const id = input.id ?? randomUUID();
+    this.db.prepare(`
+      INSERT INTO channel_messages(
+        id, channel_id, external_message_id, account_id, thread_key, sender, text,
+        payload_json, tenant_id, agent_id, status, received_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
+    `).run(
+      id,
+      input.channelId,
+      input.messageId,
+      input.accountId,
+      input.threadKey,
+      input.sender ?? null,
+      input.text ?? null,
+      encode(input.payload ?? {}),
+      input.tenantId ?? 'default',
+      input.agentId ?? 'main',
+      input.receivedAt ?? timestamp,
+      timestamp,
+    );
+    return { message: this.getChannelMessage(id), duplicate: false };
+  }
+
+  getChannelMessage(id) {
+    return hydrateChannelMessage(this.db.prepare('SELECT * FROM channel_messages WHERE id = ?').get(id));
+  }
+
+  listChannelMessages({ channelId, accountId, threadKey, status, tenantId = 'default', limit = 100 } = {}) {
+    const clauses = ['tenant_id = ?'];
+    const params = [tenantId];
+    if (channelId) {
+      clauses.push('channel_id = ?');
+      params.push(channelId);
+    }
+    if (accountId) {
+      clauses.push('account_id = ?');
+      params.push(accountId);
+    }
+    if (threadKey) {
+      clauses.push('thread_key = ?');
+      params.push(threadKey);
+    }
+    if (status) {
+      clauses.push('status = ?');
+      params.push(status);
+    }
+    return this.db.prepare(`
+      SELECT * FROM channel_messages
+      WHERE ${clauses.join(' AND ')}
+      ORDER BY received_at DESC LIMIT ?
+    `).all(...params, limit).map(hydrateChannelMessage);
+  }
+
+  markChannelMessageDelivered(id, eventId) {
+    this.db.prepare(`
+      UPDATE channel_messages
+      SET status = 'DELIVERED', event_id = ?, delivered_at = ?
+      WHERE id = ? AND status = 'PENDING'
+    `).run(eventId, now(), id);
+    return this.getChannelMessage(id);
   }
 
   listOutbox({ status, limit = 50 } = {}) {
@@ -1829,12 +2550,13 @@ export class Store {
     const id = input.id ?? randomUUID();
     this.db.prepare(`
       INSERT INTO attention_assessments(
-        id, agent_id, score, expected_value, estimated_cost,
+        id, agent_id, tenant_id, score, expected_value, estimated_cost,
         signals_json, decision_json, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       input.agentId ?? 'main',
+      input.tenantId ?? 'default',
       input.score,
       input.expectedValue,
       input.estimatedCost,
@@ -1845,24 +2567,41 @@ export class Store {
     return hydrateAttentionAssessment(this.db.prepare('SELECT * FROM attention_assessments WHERE id = ?').get(id));
   }
 
-  listAttentionAssessments({ agentId = 'main', limit = 50 } = {}) {
+  listAttentionAssessments({ agentId = 'main', tenantId, limit = 50 } = {}) {
+    const tenantClause = tenantId ? 'AND tenant_id = ?' : '';
+    const params = tenantId ? [agentId, tenantId, limit] : [agentId, limit];
     return this.db.prepare(`
       SELECT * FROM attention_assessments
-      WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?
-    `).all(agentId, limit).map(hydrateAttentionAssessment);
+      WHERE agent_id = ? ${tenantClause} ORDER BY created_at DESC LIMIT ?
+    `).all(...params).map(hydrateAttentionAssessment);
   }
 
   createMonitor(input) {
     const timestamp = now();
     const id = input.id ?? randomUUID();
+    const existing = this.getMonitor(id);
+    if (existing) {
+      if (
+        existing.agent_id !== (input.agentId ?? 'main')
+        || existing.tenant_id !== (input.tenantId ?? 'default')
+        || existing.name !== input.name
+        || existing.sensor_type !== input.sensorType
+        || existing.interval_ms !== input.intervalMs
+        || JSON.stringify(existing.config) !== JSON.stringify(input.config ?? {})
+      ) {
+        throw new Error(`Monitor id was reused with different input: ${id}`);
+      }
+      return existing;
+    }
     this.db.prepare(`
       INSERT INTO monitors(
-        id, agent_id, name, sensor_type, config_json, interval_ms, next_poll_at,
+        id, agent_id, tenant_id, name, sensor_type, config_json, interval_ms, next_poll_at,
         enabled, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       input.agentId ?? 'main',
+      input.tenantId ?? 'default',
       input.name,
       input.sensorType,
       encode(input.config ?? {}),
@@ -1879,12 +2618,16 @@ export class Store {
     return hydrateMonitor(this.db.prepare('SELECT * FROM monitors WHERE id = ?').get(id));
   }
 
-  listMonitors({ agentId, enabled, limit = 100 } = {}) {
+  listMonitors({ agentId, tenantId, enabled, limit = 100 } = {}) {
     const clauses = [];
     const params = [];
     if (agentId) {
       clauses.push('agent_id = ?');
       params.push(agentId);
+    }
+    if (tenantId) {
+      clauses.push('tenant_id = ?');
+      params.push(tenantId);
     }
     if (enabled !== undefined) {
       clauses.push('enabled = ?');
@@ -1896,13 +2639,20 @@ export class Store {
     `).all(...params, limit).map(hydrateMonitor);
   }
 
-  getDueMonitors(limit = 20) {
+  getDueMonitors(limit = 20, tenantId) {
     const timestamp = now();
-    return this.db.prepare(`
-      SELECT * FROM monitors
-      WHERE enabled = 1 AND status = 'IDLE' AND next_poll_at <= ?
-      ORDER BY next_poll_at ASC LIMIT ?
-    `).all(timestamp, limit).map(hydrateMonitor);
+    const rows = tenantId
+      ? this.db.prepare(`
+          SELECT * FROM monitors
+          WHERE enabled = 1 AND status = 'IDLE' AND tenant_id = ? AND next_poll_at <= ?
+          ORDER BY next_poll_at ASC LIMIT ?
+        `).all(tenantId, timestamp, limit)
+      : this.db.prepare(`
+          SELECT * FROM monitors
+          WHERE enabled = 1 AND status = 'IDLE' AND next_poll_at <= ?
+          ORDER BY next_poll_at ASC LIMIT ?
+        `).all(timestamp, limit);
+    return rows.map(hydrateMonitor);
   }
 
   claimMonitor(id, leaseMs = 30_000) {
@@ -2236,9 +2986,15 @@ export class Store {
       pendingApprovals: this.db.prepare("SELECT COUNT(*) AS count FROM approvals WHERE status = 'PENDING'").get().count,
       enabledSchedules: this.db.prepare('SELECT COUNT(*) AS count FROM schedules WHERE enabled = 1').get().count,
       pendingOutbox: this.db.prepare("SELECT COUNT(*) AS count FROM outbox WHERE status IN ('PENDING', 'RETRY')").get().count,
+      pendingChannelMessages: this.db.prepare("SELECT COUNT(*) AS count FROM channel_messages WHERE status = 'PENDING'").get().count,
       enabledMonitors: this.db.prepare('SELECT COUNT(*) AS count FROM monitors WHERE enabled = 1').get().count,
       pendingInterrupts: this.db.prepare("SELECT COUNT(*) AS count FROM interrupts WHERE status = 'PENDING'").get().count,
       residentProcesses: this.db.prepare("SELECT COUNT(*) AS count FROM kernel_processes WHERE status = 'RUNNING'").get().count,
+      uncertainOperations: this.db.prepare(`
+        SELECT COUNT(*) AS count FROM operations
+        WHERE state IN ('UNCERTAIN', 'RECONCILING', 'COMPENSATING', 'COMPENSATION_UNCERTAIN')
+      `).get().count,
+      activeCapabilityContracts: this.db.prepare("SELECT COUNT(*) AS count FROM goal_contracts WHERE capability_status = 'ACTIVE'").get().count,
     };
   }
 

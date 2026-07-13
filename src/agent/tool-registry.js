@@ -44,22 +44,44 @@ function validateSchema(value, schema, path = 'arguments') {
 }
 
 export class ToolRegistry {
-  constructor({ approvalRisk = 'high', hooks, policy = {} } = {}) {
+  constructor({
+    approvalRisk = 'high', hooks, policy = {}, capabilities, resources,
+    pools, operations, credentials, sandboxes,
+  } = {}) {
     this.tools = new Map();
     this.approvalRisk = approvalRisk;
     this.hooks = hooks;
     this.policy = { allow: ['*'], deny: [], ...policy };
+    this.capabilities = capabilities;
+    this.resources = resources;
+    this.pools = pools;
+    this.operations = operations;
+    this.credentials = credentials;
+    this.sandboxes = sandboxes;
   }
 
   register(definition) {
     if (!definition?.name || typeof definition.execute !== 'function') throw new Error('Invalid tool definition');
     if (this.tools.has(definition.name)) throw new Error(`Tool already registered: ${definition.name}`);
-    this.tools.set(definition.name, {
+    const tool = {
       risk: 'low',
       description: '',
+      resourcePool: 'default',
       parameters: { type: 'object', properties: {}, additionalProperties: false },
       ...definition,
-    });
+    };
+    if (tool.sideEffect?.mode === 'non-idempotent') {
+      tool.resourcePool = 'isolated-side-effects';
+      if ((RISK_LEVEL[tool.risk] ?? 0) < RISK_LEVEL.high) tool.risk = 'high';
+    }
+    if (['browser', 'code'].includes(tool.resourcePool) && !tool.sandbox) {
+      throw new Error(`Tool ${tool.name} requires a registered sandbox adapter for pool ${tool.resourcePool}`);
+    }
+    if (tool.sandbox && !this.sandboxes?.has(tool.sandbox)) {
+      throw new Error(`Tool ${tool.name} references an unavailable sandbox adapter: ${tool.sandbox}`);
+    }
+    this.tools.set(definition.name, tool);
+    this.operations?.registerTool(tool);
     return this;
   }
 
@@ -92,9 +114,29 @@ export class ToolRegistry {
     if (!tool) return { ok: false, error: `Unknown tool: ${name}` };
     if (!this.isAllowed(name)) return { ok: false, error: `Tool blocked by policy: ${name}` };
     validateSchema(args, tool.parameters);
-    await this.hooks?.emit('before_tool_call', { tool: name, args, context });
     try {
-      const result = await tool.execute(args, { ...context, tool, requiresApproval: this.requiresApproval(tool) });
+      this.capabilities?.authorizeTool(context.task.goal_id, tool, args, context);
+      this.resources?.recordToolCall({
+        goalId: context.task.goal_id,
+        toolName: name,
+        resourcePool: tool.resourcePool,
+        idempotencyKey: `${context.idempotencyKey}:usage`,
+      });
+      await this.hooks?.emit('before_tool_call', { tool: name, args, context });
+      const directExecute = () => tool.execute(args, {
+        ...context,
+        tool,
+        credentials: this.credentials,
+        requiresApproval: this.requiresApproval(tool),
+      });
+      const execute = () => tool.sandbox
+        ? this.sandboxes.run(tool.sandbox, { tool, args, context, execute: directExecute })
+        : directExecute();
+      const result = await this.pools.run(tool.resourcePool, () => (
+        this.operations
+          ? this.operations.execute(tool, args, context, execute)
+          : execute()
+      ), context.signal);
       await this.hooks?.emit('after_tool_call', { tool: name, args, result, context });
       return result;
     } catch (error) {

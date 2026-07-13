@@ -2,7 +2,7 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 export class PluginManager {
-  constructor({ config, tools, actions, channels, hooks, sensors, listeners }) {
+  constructor({ config, tools, actions, channels, hooks, sensors, listeners, sandboxes }) {
     this.config = config;
     this.tools = tools;
     this.actions = actions;
@@ -10,6 +10,7 @@ export class PluginManager {
     this.hooks = hooks;
     this.sensors = sensors;
     this.listeners = listeners;
+    this.sandboxes = sandboxes;
     this.loaded = [];
     this.diagnostics = [];
   }
@@ -36,9 +37,22 @@ export class PluginManager {
       pluginId: plugin.id,
       registerTool: (tool) => this.tools.register(tool),
       registerAction: (name, handler) => this.actions.register(name, handler),
-      registerChannel: (id, adapter) => this.channels.register(id, adapter),
+      registerChannel: (id, adapter) => {
+        this.channels.register(id, adapter);
+        if (typeof adapter.listen === 'function') {
+          this.listeners.register(`channel-${id}`, {
+            description: adapter.description ?? `Resident inbound listener for ${id}`,
+            run: (context) => adapter.listen({
+              ...context,
+              ingest: (message) => this.channels.ingest(id, message),
+            }),
+          });
+        }
+        return this.channels;
+      },
       registerSensor: (type, sensor) => this.sensors.register(type, sensor),
       registerListener: (name, listener) => this.listeners.register(name, listener),
+      registerSandbox: (name, adapter) => this.sandboxes.register(name, adapter),
       on: (name, handler, options) => this.hooks.on(name, handler, options),
     });
   }

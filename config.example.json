@@ -2,7 +2,10 @@
   "gateway": {
     "bind": "127.0.0.1",
     "port": 3030,
-    "auth": { "token": null }
+    "auth": {
+      "tokenEnv": "AGENT_GATEWAY_TOKEN",
+      "tokenRef": null
+    }
   },
   "runtime": {
     "maxConcurrency": 4,
@@ -61,6 +64,8 @@
     }
   },
   "security": {
+    "tenantId": "default",
+    "secretFile": "./data/secrets.json",
     "approvalRisk": "high",
     "allowRemoteWithoutAuth": false,
     "allowLocalBypass": true,
@@ -74,12 +79,13 @@
       "resourcePools": ["*"],
       "filesystem": { "roots": ["."], "operations": ["list", "read", "write", "delete"] },
       "network": { "domains": ["*"], "methods": ["GET"] },
-      "accounts": {},
+      "accounts": { "channel": ["*"] },
       "dataScopes": ["agent:self"],
-      "credentialRefs": []
+      "credentialRefs": [],
+      "constraints": {}
     },
     "events": {
-      "requireSignature": false,
+      "requireSignature": true,
       "replayWindowMs": 300000,
       "sourceSecrets": {}
     }
@@ -96,9 +102,21 @@
     "default": {
       "provider": "openai-compatible",
       "baseUrl": "https://api.openai.com/v1",
-      "apiKey": null,
+      "apiKeyEnv": "OPENAI_API_KEY",
+      "apiKeyRef": null,
       "model": "gpt-4.1-mini",
-      "timeoutMs": 90000
+      "timeoutMs": 90000,
+      "inputCostPerMillion": 0,
+      "outputCostPerMillion": 0
     }
+  },
+  "memory": {
+    "captureMode": "explicit",
+    "maxRecallEntries": 8,
+    "maxEntryChars": 12000
+  },
+  "onboarding": {
+    "completedAt": null,
+    "version": null
   }
 }

@@ -1,7 +1,8 @@
 export class ListenerRegistry {
-  constructor({ eventBus, store }) {
+  constructor({ eventBus, store, tenantId = 'default' }) {
     this.eventBus = eventBus;
     this.store = store;
+    this.tenantId = tenantId;
     this.listeners = new Map();
   }
 
@@ -26,6 +27,10 @@ export class ListenerRegistry {
         publish: (event) => this.eventBus.publish({
           ...event,
           source: event.source ?? `listener:${listener.name}`,
+          tenantId: event.tenantId ?? this.tenantId,
+          agentId: event.agentId ?? 'main',
+          authenticated: event.authenticated ?? true,
+          authSubject: event.authSubject ?? `listener:${listener.name}`,
         }),
       }),
     }));

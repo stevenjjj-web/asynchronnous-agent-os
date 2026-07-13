@@ -1,6 +1,6 @@
 {
   "name": "agent-os-runtime",
-  "version": "0.4.0",
+  "version": "0.10.0",
   "private": true,
   "description": "Resident asynchronous personal agent operating system with supervised services, durable goals, interrupts and long-term memory",
   "type": "module",
