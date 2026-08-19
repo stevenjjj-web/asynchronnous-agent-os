@@ -2,8 +2,9 @@ import { createInterface } from 'node:readline/promises';
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { resolve } from 'node:path';
-import { writeConfigFile, writeSecretFile } from '../platform/config.js';
+import { SAFE_BUILTIN_TOOLS, validateConfig, writeConfigFile, writeSecretFile } from '../platform/config.js';
 import { owlArt, MASCOT_TAGLINE } from './mascot.js';
+import { requestBoundedText } from '../security/public-fetch.js';
 
 export const MODEL_PRESETS = Object.freeze({
   openai: {
@@ -101,7 +102,7 @@ export function buildSetupConfiguration(current, answers, timestamp = Date.now()
       ...config.gateway.auth,
       token: null,
       tokenEnv: null,
-      tokenRef: networkAccess ? 'gateway.auth.token' : null,
+      tokenRef: 'gateway.auth.token',
     },
   };
   config.models.default = {
@@ -129,7 +130,20 @@ export function buildSetupConfiguration(current, answers, timestamp = Date.now()
   };
   config.security = {
     ...config.security,
-    approvalRisk: answers.approvalRisk ?? 'high',
+    approvalRisk: answers.approvalRisk ?? 'medium',
+    allowLocalBypass: false,
+    allowRemoteWithoutAuth: false,
+    tools: { allow: [...SAFE_BUILTIN_TOOLS], deny: [] },
+    capabilities: {
+      tools: [...SAFE_BUILTIN_TOOLS],
+      resourcePools: ['default', 'memory', 'filesystem'],
+      filesystem: { roots: ['.'], operations: ['list', 'read', 'write'] },
+      network: { domains: [], methods: [] },
+      accounts: { channel: ['*'] },
+      dataScopes: ['agent:self'],
+      credentialRefs: [],
+      constraints: {},
+    },
   };
   config.onboarding = {
     completedAt: timestamp,
@@ -182,6 +196,7 @@ export function askSecret(input, output, prompt = 'API key') {
             output.write('\b \b');
           }
         } else if (character >= ' ') {
+          if (value.length >= 16_384) return finish(new Error('Secret exceeds 16384 characters'));
           value += character;
           output.write('•');
         }
@@ -199,13 +214,16 @@ export async function validateModelEndpoint({ baseUrl, apiKey, timeoutMs = 5_000
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(`${baseUrl.replace(/\/$/, '')}/models`, {
+    const response = await requestBoundedText(`${baseUrl.replace(/\/$/, '')}/models`, {
       headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {},
       signal: controller.signal,
+      timeoutMs,
+      maxBytes: 1_000_000,
     });
-    return response.ok
-      ? { ok: true, status: response.status }
-      : { ok: false, status: response.status, error: (await response.text()).slice(0, 300) };
+    if (response.status < 200 || response.status >= 300) {
+      return { ok: false, status: response.status, error: `Provider returned HTTP ${response.status}` };
+    }
+    return { ok: true, status: response.status };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   } finally {
@@ -227,9 +245,7 @@ export async function runSetupWizard({ currentConfig, input, output, format }) {
     { value: 'local', label: 'This computer only', description: 'Recommended; listens on localhost' },
     { value: 'network', label: 'Local network', description: 'Requires a generated bearer token' },
   ], ['0.0.0.0', '::'].includes(currentConfig.gateway.bind) ? 2 : 1);
-  const gatewayToken = accessProfile === 'network'
-    ? currentConfig.gateway.auth?.token ?? randomBytes(32).toString('hex')
-    : null;
+  const gatewayToken = currentConfig.gateway.auth?.token ?? randomBytes(32).toString('hex');
   const presetEntries = Object.entries(MODEL_PRESETS);
   const currentPresetIndex = presetEntries.findIndex(([, candidate]) => (
     candidate.provider === currentConfig.models.default?.provider
@@ -279,6 +295,11 @@ export async function runSetupWizard({ currentConfig, input, output, format }) {
     secretMode, apiKeyEnv, budgetProfile, autonomy, approvalRisk,
   };
   const nextConfig = buildSetupConfiguration(currentConfig, answers);
+  const configErrors = validateConfig({
+    ...nextConfig,
+    gateway: { ...nextConfig.gateway, auth: { ...nextConfig.gateway.auth, token: gatewayToken } },
+  });
+  if (configErrors.length) throw new Error(`Setup configuration is invalid: ${configErrors.join('; ')}`);
 
   let validation = { ok: true, skipped: true };
   if (preset.provider !== 'offline') {
@@ -297,7 +318,7 @@ export async function runSetupWizard({ currentConfig, input, output, format }) {
     }
   }
   output.write(`\n${format.bold('Setup summary')}\n`);
-  output.write(`  Agent       ${agentName}\n  Model       ${preset.label} · ${modelId}\n  Workspace   ${nextConfig.agents[0].workspace}\n  Access      ${accessProfile === 'network' ? 'local network · bearer token protected' : 'this computer only'}\n  Resources   ${BUDGET_PROFILES[budgetProfile].label}\n  Cognition   ${autonomy}\n  Approvals   ${approvalRisk}\n  Memory      explicit long-term capture\n`);
+  output.write(`  Agent       ${agentName}\n  Model       ${preset.label} · ${modelId}\n  Workspace   ${nextConfig.agents[0].workspace}\n  Access      ${accessProfile === 'network' ? 'local network · bearer token protected' : 'this computer only · bearer token protected'}\n  Resources   ${BUDGET_PROFILES[budgetProfile].label}\n  Cognition   ${autonomy}\n  Approvals   ${approvalRisk}\n  Memory      explicit long-term capture\n`);
   const confirmed = await ask(input, output, format, 'Save this configuration?', 'yes');
   if (!/^y(es)?$/i.test(confirmed)) throw new Error('Setup cancelled');
   const secrets = {};
@@ -401,6 +422,8 @@ export async function runModelWizard({ currentConfig, input, output, format, ini
     inputCostPerMillion: existing?.inputCostPerMillion ?? 0,
     outputCostPerMillion: existing?.outputCostPerMillion ?? 0,
   };
+  const configErrors = validateConfig(nextConfig);
+  if (configErrors.length) throw new Error(`Model configuration is invalid: ${configErrors.join('; ')}`);
   if (enteredApiKey) writeSecretFile(nextConfig.security.secretFile, { model: { [modelKey]: { apiKey: enteredApiKey } } });
   writeConfigFile(currentConfig.configPath, nextConfig);
   output.write(`${format.green('✓')} Added models.${modelKey}. The Gateway will reload it now.\n`);

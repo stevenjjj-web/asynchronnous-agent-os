@@ -4,6 +4,7 @@ import { ensureWorkspace } from './platform/workspace.js';
 import { createProviderRegistry } from './agent/providers.js';
 import { ActionControl, ToolRegistry } from './agent/tool-registry.js';
 import { MemoryService } from './agent/memory-service.js';
+import { MemoryPortabilityService } from './agent/memory-portability.js';
 import { ContextBuilder } from './agent/context-builder.js';
 import { AgentTurnService } from './agent/agent-turn.js';
 import { SessionService } from './agent/session-service.js';
@@ -73,6 +74,7 @@ export class PersonalAgentSystem {
       this.store.upsertAgent(agent);
     }
     this.memory = new MemoryService({ store: this.store, config });
+    this.memoryPortability = new MemoryPortabilityService({ store: this.store, memory: this.memory, config });
     this.contextBuilder = new ContextBuilder({ store: this.store, memory: this.memory, resources: this.resources, config });
     this.agentTurn = new AgentTurnService({
       store: this.store,
@@ -122,14 +124,17 @@ export class PersonalAgentSystem {
     });
     this.channels.register('web', {
       name: 'HTTP API',
+      supportsIdempotency: true,
       send: async (record) => ({ ok: true, local: true, outboxId: record.id }),
     });
     this.channels.register('terminal', {
       name: 'Local Terminal',
+      supportsIdempotency: true,
       send: async (record) => ({ ok: true, local: true, outboxId: record.id }),
     });
     this.channels.register('internal', {
       name: 'Internal Agent-to-Agent',
+      supportsIdempotency: true,
       send: async (record) => ({ ok: true, internal: true, outboxId: record.id }),
     });
     this.channels.register('webhook', {
@@ -148,6 +153,7 @@ export class PersonalAgentSystem {
       sensors: this.sensors,
       listeners: this.listeners,
       sandboxes: this.sandboxes,
+      memoryPortability: this.memoryPortability,
     });
     this.interrupts = new InterruptController({
       store: this.store,
@@ -182,6 +188,7 @@ export class PersonalAgentSystem {
       interrupts: this.interrupts,
       cognition: this.cognition,
       planRepair: this.planRepair,
+      memoryPortability: this.memoryPortability,
       listeners: this.listeners,
       config,
     });
@@ -485,7 +492,7 @@ export class PersonalAgentSystem {
       .register({
         name: 'spawn_goals',
         description: 'Splits independent work into 1-5 persistent child goals. It can return immediately or suspend the parent until the children finish.',
-        risk: 'medium',
+        risk: 'low',
         parameters: {
           type: 'object',
           properties: {
@@ -507,7 +514,10 @@ export class PersonalAgentSystem {
           const depth = Number(context.session.metadata.spawnDepth ?? 0);
           let childGoalIds = context.toolState?.childGoalIds;
           if (!childGoalIds) {
-            this.resources.authorizeFanOut(context.task.goal_id, args.goals.length, depth + 1);
+            const messageIds = args.goals.map((_, index) => `${context.idempotencyKey}:child:${index}`);
+            const recovered = messageIds.map((messageId) => this.store.getMessage(messageId)?.run_id ?? null);
+            const missingCount = recovered.filter((goalId) => !goalId).length;
+            this.resources.authorizeFanOut(context.task.goal_id, missingCount, depth + 1);
             const children = [];
             for (const [index, goal] of args.goals.entries()) {
               const accepted = await this.sessions.submit({
@@ -517,7 +527,7 @@ export class PersonalAgentSystem {
                 peerKey: `parent:${context.task.goal_id}`,
                 threadKey: `${context.task.id}:${index}`,
                 text: goal.objective,
-                messageId: `${context.idempotencyKey}:child:${index}`,
+                messageId: messageIds[index],
                 provenance: `child-goal:${context.task.goal_id}`,
                 parentGoalId: context.task.goal_id,
                 spawnDepth: depth + 1,
@@ -705,7 +715,7 @@ export class PersonalAgentSystem {
 
   async submit(input) {
     const accepted = await this.sessions.submit(input);
-    const priority = Math.max(10, Math.min(100, Number(input.priority ?? 80)));
+    const priority = accepted.goal.metadata.priority ?? 80;
     if (input.interrupt === true || priority >= this.config.kernel.preemptionPriority) {
       const interrupt = this.interrupts.raise({
         agentId: accepted.session.agent_id,
@@ -723,6 +733,12 @@ export class PersonalAgentSystem {
   }
 
   async createGoal(objective, options = {}) {
+    const parentGoal = options.parentGoalId ? this.store.getGoal(options.parentGoalId) : null;
+    if (options.parentGoalId && !parentGoal) throw new Error(`Parent goal is unavailable: ${options.parentGoalId}`);
+    const spawnDepth = Number(options.spawnDepth ?? (parentGoal ? Number(parentGoal.metadata.spawnDepth ?? 0) + 1 : 0));
+    if (!Number.isInteger(spawnDepth) || spawnDepth < 0 || spawnDepth > 100) {
+      throw new Error('spawnDepth must be an integer between 0 and 100');
+    }
     const contract = this.buildGoalContract({
       agentId: options.agentId ?? 'main',
       tenantId: options.tenantId ?? this.config.security.tenantId,
@@ -731,9 +747,10 @@ export class PersonalAgentSystem {
       budget: options.budget,
       capabilities: options.capabilities,
       capabilityExpiresAt: options.capabilityExpiresAt,
+      spawnDepth,
       createdBy: options.createdBy ?? 'api',
     });
-    const view = await this.runtime.createGoal(objective, { ...options, contract });
+    const view = await this.runtime.createGoal(objective, { ...options, spawnDepth, contract });
     const priority = Math.max(10, Math.min(100, Number(options.priority ?? 80)));
     if (options.interrupt === true || priority >= this.config.kernel.preemptionPriority) {
       this.interrupts.raise({

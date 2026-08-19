@@ -1,15 +1,59 @@
 import { createServer } from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { loadConfig, validateConfig } from './platform/config.js';
 import { PersonalAgentSystem } from './system.js';
+import { authorizeGatewayRequest, BoundedRateLimiter } from './security/gateway-auth.js';
+import { runSecurityAudit } from './security/audit.js';
+import { requestBoundedText } from './security/public-fetch.js';
 
 const config = loadConfig({ projectRoot: process.cwd() });
 const configErrors = validateConfig(config);
 if (configErrors.length) throw new Error(`Invalid configuration:\n- ${configErrors.join('\n- ')}`);
+const startupSecurityAudit = runSecurityAudit(config);
+const productionMode = process.env.NODE_ENV === 'production';
+const blockingFindings = startupSecurityAudit.findings
+  .filter((item) => item.severity === 'critical' || productionMode && item.severity === 'high');
+if (blockingFindings.length > 0) {
+  const details = blockingFindings.map((item) => `${item.id}: ${item.title}`);
+  throw new Error(`Gateway startup blocked by security findings:\n- ${details.join('\n- ')}`);
+}
+if (startupSecurityAudit.summary.high > 0) {
+  const ids = startupSecurityAudit.findings.filter((item) => item.severity === 'high').map((item) => item.id);
+  process.stderr.write(`Security warning: ${startupSecurityAudit.summary.high} high-severity finding(s): ${ids.join(', ')}. Run "agent-os security audit".\n`);
+}
 const port = config.gateway.port;
 const ownerTenantId = config.security.tenantId ?? 'default';
 const runtime = await new PersonalAgentSystem(config).start();
-const rateWindows = new Map();
 const modelCatalogCache = new Map();
+const sseClients = new Set();
+const INTERNAL_EVENT_TOPICS = new Set([
+  'approval.resolved', 'goal.completed', 'channel.message', 'monitor.changed', 'cognition.attention',
+]);
+const authLimiter = new BoundedRateLimiter({
+  windowMs: config.gateway.rateLimit.windowMs,
+  maxAttempts: config.gateway.rateLimit.authMaxAttempts,
+  lockoutMs: config.gateway.rateLimit.authLockoutMs,
+  maxEntries: config.gateway.rateLimit.maxEntries,
+});
+const readRequestLimiter = new BoundedRateLimiter({
+  windowMs: config.gateway.rateLimit.windowMs,
+  maxAttempts: config.gateway.rateLimit.maxRequests,
+  lockoutMs: config.gateway.rateLimit.windowMs,
+  maxEntries: config.gateway.rateLimit.maxEntries,
+});
+const writeRequestLimiter = new BoundedRateLimiter({
+  windowMs: config.gateway.rateLimit.windowMs,
+  maxAttempts: config.gateway.rateLimit.maxWrites,
+  lockoutMs: config.gateway.rateLimit.windowMs,
+  maxEntries: config.gateway.rateLimit.maxEntries,
+});
+
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
 
 async function discoverModels(key, model) {
   const fallback = [{ modelKey: key, modelId: model.model, provider: model.provider, configured: true }];
@@ -19,13 +63,17 @@ async function discoverModels(key, model) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 8_000);
   try {
-    const response = await fetch(`${model.baseUrl.replace(/\/$/, '')}/models`, {
+    const response = await requestBoundedText(`${model.baseUrl.replace(/\/$/, '')}/models`, {
       headers: model.apiKey ? { authorization: `Bearer ${model.apiKey}` } : {},
       signal: controller.signal,
+      timeoutMs: 8_000,
+      maxBytes: 2_000_000,
+      allowPrivateNetwork: model.allowPrivateNetwork === true,
     });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const body = await response.json();
-    const ids = [...new Set((body.data ?? []).map((item) => item?.id).filter(Boolean).map(String))].sort();
+    if (response.status < 200 || response.status >= 300) throw new Error(`HTTP ${response.status}`);
+    const body = JSON.parse(response.content);
+    if (!Array.isArray(body.data ?? [])) throw new Error('Model catalog has an invalid data field');
+    const ids = [...new Set((body.data ?? []).map((item) => item?.id).filter(Boolean).map(String).filter((id) => id.length <= 256))].sort();
     const ordered = [model.model, ...ids.filter((id) => id !== model.model)].slice(0, 2_000);
     const value = {
       choices: ordered.map((modelId) => ({
@@ -48,50 +96,82 @@ async function discoverModels(key, model) {
 }
 
 function json(res, status, body) {
+  let serialized = JSON.stringify(body);
+  if (Buffer.byteLength(serialized) > 5_000_000) {
+    status = 413;
+    serialized = JSON.stringify({ error: 'response exceeds 5 MB; request a smaller page' });
+  }
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    'content-security-policy': "default-src 'none'; frame-ancestors 'none'",
+    'referrer-policy': 'no-referrer',
+    'permissions-policy': 'camera=(), microphone=(), geolocation=()',
+    'cross-origin-resource-policy': 'same-origin',
   });
-  res.end(JSON.stringify(body));
+  res.end(serialized);
 }
 
-async function readJson(req) {
+async function readJson(req, { maxBytes = 1_000_000 } = {}) {
+  const declared = Number(req.headers['content-length']);
+  if (!Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > 8_000_000) throw new Error('Invalid request body limit');
+  if (Number.isFinite(declared) && declared > maxBytes) throw new HttpError(413, 'Request body too large');
+  const contentType = String(req.headers['content-type'] ?? '').split(';', 1)[0].trim().toLowerCase();
+  if (contentType && contentType !== 'application/json') throw new HttpError(415, 'Content-Type must be application/json');
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 1_000_000) throw new Error('Request body too large');
+    if (size > maxBytes) throw new HttpError(413, 'Request body too large');
     chunks.push(chunk);
   }
   if (!chunks.length) return {};
-  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
-}
-
-function isLoopback(address) {
-  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
-}
-
-function isAuthorized(req, url) {
-  if (config.security.allowLocalBypass && isLoopback(req.socket.remoteAddress)) return true;
-  const expected = config.gateway.auth.token;
-  if (!expected) return config.security.allowRemoteWithoutAuth;
-  const bearer = req.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
-  return bearer === expected || url.searchParams.get('token') === expected;
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch {
+    throw new HttpError(400, 'Request body is not valid JSON');
+  }
 }
 
 function isRateLimited(req) {
-  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method) || isLoopback(req.socket.remoteAddress)) return false;
-  const key = req.socket.remoteAddress ?? 'unknown';
-  const timestamp = Date.now();
-  const windowMs = config.gateway.rateLimit?.windowMs ?? 60_000;
-  const maxWrites = config.gateway.rateLimit?.maxWrites ?? 120;
-  const current = rateWindows.get(key);
-  if (!current || timestamp - current.startedAt >= windowMs) {
-    rateWindows.set(key, { startedAt: timestamp, count: 1 });
-    return false;
+  const address = req.socket.remoteAddress ?? 'unknown';
+  const write = !['GET', 'HEAD', 'OPTIONS'].includes(req.method);
+  const key = `${address}:${write ? 'write' : 'read'}`;
+  const limiter = write ? writeRequestLimiter : readRequestLimiter;
+  const gate = limiter.check(key);
+  if (!gate.allowed) return gate;
+  limiter.record(key);
+  return null;
+}
+
+function queryInteger(url, name, { fallback, minimum = 0, maximum = 1_000 } = {}) {
+  const raw = url.searchParams.get(name);
+  if (raw == null || raw === '') return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < minimum || value > maximum) {
+    throw new HttpError(400, `${name} must be an integer between ${minimum} and ${maximum}`);
   }
-  current.count += 1;
-  return current.count > maxWrites;
+  return value;
+}
+
+function inputText(value, name, { maximum, required = true, trim = true } = {}) {
+  if (value == null && !required) return null;
+  if (typeof value !== 'string') throw new HttpError(400, `${name} must be a string`);
+  const candidate = trim ? value.trim() : value;
+  if ((required && !candidate) || candidate.length > maximum || candidate.includes('\0')) {
+    throw new HttpError(400, `${name} must contain ${required ? '1' : '0'} to ${maximum} characters`);
+  }
+  return candidate;
+}
+
+function inputNumber(value, name, { minimum = -Infinity, maximum = Infinity, integer = false, required = true } = {}) {
+  if (value == null && !required) return null;
+  const candidate = Number(value);
+  if (!Number.isFinite(candidate) || integer && !Number.isInteger(candidate) || candidate < minimum || candidate > maximum) {
+    throw new HttpError(400, `${name} is outside its allowed numeric range`);
+  }
+  return candidate;
 }
 
 function listGoalSummaries() {
@@ -106,8 +186,14 @@ function listGoalSummaries() {
 }
 
 function resolveTenant(body = {}) {
-  if (body.tenantId && body.tenantId !== ownerTenantId) throw new Error('Cross-tenant access is not allowed by this gateway');
+  if (body.tenantId && body.tenantId !== ownerTenantId) throw new HttpError(403, 'Cross-tenant access is not allowed by this gateway');
   return ownerTenantId;
+}
+
+function resolveAgentId(value = 'main') {
+  const agentId = String(value ?? 'main');
+  if (!runtime.store.getAgent(agentId)) throw new HttpError(400, `unknown agent: ${agentId}`);
+  return agentId;
 }
 
 function ownsGoal(goal) {
@@ -123,6 +209,9 @@ function ownsSession(session) {
 }
 
 async function handleApi(req, res, url) {
+  if (req.method === 'GET' && url.pathname === '/api/security/audit') {
+    return json(res, 200, runSecurityAudit(config));
+  }
   if (req.method === 'GET' && url.pathname === '/api/metrics') {
     const stats = runtime.store.getStats();
     const lines = [
@@ -132,6 +221,10 @@ async function handleApi(req, res, url) {
       `agent_os_sessions_total ${stats.sessions}`,
       '# TYPE agent_os_memories_total gauge',
       `agent_os_memories_total ${stats.memories}`,
+      '# TYPE agent_os_memory_candidates gauge',
+      `agent_os_memory_candidates ${stats.memoryCandidates}`,
+      '# TYPE agent_os_failed_memory_syncs gauge',
+      `agent_os_failed_memory_syncs ${stats.failedMemorySyncs}`,
       '# TYPE agent_os_pending_approvals gauge',
       `agent_os_pending_approvals ${stats.pendingApprovals}`,
       '# TYPE agent_os_pending_outbox gauge',
@@ -139,7 +232,12 @@ async function handleApi(req, res, url) {
       ...Object.entries(stats.tasks).map(([status, count]) => `agent_os_tasks{status="${status.toLowerCase()}"} ${count}`),
       ...Object.entries(stats.goals).map(([status, count]) => `agent_os_goals{status="${status.toLowerCase()}"} ${count}`),
     ];
-    res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8', 'cache-control': 'no-store' });
+    res.writeHead(200, {
+      'content-type': 'text/plain; version=0.0.4; charset=utf-8',
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+      'referrer-policy': 'no-referrer',
+    });
     res.end(`${lines.join('\n')}\n`);
     return;
   }
@@ -223,14 +321,14 @@ async function handleApi(req, res, url) {
   if (req.method === 'GET' && url.pathname === '/api/task-manager') {
     return json(res, 200, runtime.observability.taskManager({
       includeTerminal: url.searchParams.get('includeTerminal') === 'true',
-      limit: Number(url.searchParams.get('limit') ?? 100),
+      limit: queryInteger(url, 'limit', { fallback: 100, minimum: 1, maximum: 500 }),
       tenantId: ownerTenantId,
     }));
   }
 
   if (req.method === 'GET' && url.pathname === '/api/inbox') {
     return json(res, 200, runtime.inbox.snapshot({
-      limit: Number(url.searchParams.get('limit') ?? 20),
+      limit: queryInteger(url, 'limit', { fallback: 20, minimum: 1, maximum: 200 }),
     }));
   }
 
@@ -265,7 +363,7 @@ async function handleApi(req, res, url) {
         threadKey: url.searchParams.get('threadKey') ?? undefined,
         status: url.searchParams.get('status') ?? undefined,
         tenantId: ownerTenantId,
-        limit: Number(url.searchParams.get('limit') ?? 100),
+        limit: queryInteger(url, 'limit', { fallback: 100, minimum: 1, maximum: 500 }),
       }),
     });
   }
@@ -283,7 +381,7 @@ async function handleApi(req, res, url) {
         payload: body.payload,
         receivedAt: body.receivedAt,
         tenantId: resolveTenant(body),
-        agentId: body.agentId ?? 'main',
+        agentId: resolveAgentId(body.agentId),
       }));
     } catch (error) {
       return json(res, 409, { error: error instanceof Error ? error.message : String(error) });
@@ -302,7 +400,7 @@ async function handleApi(req, res, url) {
   if (req.method === 'GET' && url.pathname === '/api/kernel/processes') {
     return json(res, 200, { processes: runtime.store.listKernelProcesses({
       status: url.searchParams.get('status') ?? undefined,
-      limit: Number(url.searchParams.get('limit') ?? 100),
+      limit: queryInteger(url, 'limit', { fallback: 100, minimum: 1, maximum: 500 }),
     }) });
   }
 
@@ -319,7 +417,7 @@ async function handleApi(req, res, url) {
     const operations = runtime.store.listOperations({
       state: url.searchParams.get('state') ?? undefined,
       goalId: url.searchParams.get('goalId') ?? undefined,
-      limit: Number(url.searchParams.get('limit') ?? 100),
+      limit: queryInteger(url, 'limit', { fallback: 100, minimum: 1, maximum: 500 }),
     }).filter((operation) => ownsGoal(runtime.store.getGoal(operation.goal_id)));
     return json(res, 200, { operations });
   }
@@ -347,7 +445,7 @@ async function handleApi(req, res, url) {
     return json(res, 200, { assessments: runtime.store.listAttentionAssessments({
       agentId: url.searchParams.get('agentId') ?? 'main',
       tenantId: ownerTenantId,
-      limit: Number(url.searchParams.get('limit') ?? 50),
+      limit: queryInteger(url, 'limit', { fallback: 50, minimum: 1, maximum: 500 }),
     }) });
   }
 
@@ -361,14 +459,16 @@ async function handleApi(req, res, url) {
 
   if (req.method === 'POST' && url.pathname === '/api/credentials') {
     const body = await readJson(req);
-    if (!String(body.locator ?? '').startsWith('env:')) return json(res, 400, { error: 'credential locator must be an env: reference' });
+    if (!/^env:[A-Z_][A-Z0-9_]*$/i.test(String(body.locator ?? ''))) return json(res, 400, { error: 'credential locator must be a valid env: reference' });
+    const expiresAt = body.expiresAt == null ? null : new Date(body.expiresAt).getTime();
+    if (expiresAt != null && (!Number.isFinite(expiresAt) || expiresAt <= Date.now())) throw new HttpError(400, 'expiresAt must be a future date or timestamp');
     const reference = runtime.store.createCredentialRef({
       id: body.id,
       tenantId: resolveTenant(body),
-      agentId: body.agentId ?? 'main',
+      agentId: resolveAgentId(body.agentId),
       provider: 'environment',
       locator: String(body.locator).slice(4),
-      expiresAt: body.expiresAt,
+      expiresAt,
       metadata: body.metadata,
     });
     const { locator, ...safeReference } = reference;
@@ -385,18 +485,24 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === 'GET' && url.pathname === '/api/interrupts') {
-    return json(res, 200, { interrupts: runtime.store.listInterrupts({
+    const interrupts = runtime.store.listInterrupts({
       status: url.searchParams.get('status') ?? undefined,
-      limit: Number(url.searchParams.get('limit') ?? 100),
-    }) });
+      limit: queryInteger(url, 'limit', { fallback: 100, minimum: 1, maximum: 500 }),
+    }).filter((interrupt) => (
+      runtime.store.getAgent(interrupt.agent_id)
+      && (!interrupt.goal_id || ownsGoal(runtime.store.getGoal(interrupt.goal_id)))
+    ));
+    return json(res, 200, { interrupts });
   }
 
   if (req.method === 'POST' && url.pathname === '/api/interrupts') {
     const body = await readJson(req);
+    inputNumber(body.priority ?? 100, 'priority', { minimum: 0, maximum: 100 });
+    if (body.reason != null) inputText(body.reason, 'reason', { maximum: 4_000 });
     if (body.goalId && !ownsGoal(runtime.store.getGoal(body.goalId))) return json(res, 404, { error: 'goal not found' });
     if (body.targetTaskId && !ownsTask(runtime.store.getTask(body.targetTaskId))) return json(res, 404, { error: 'task not found' });
     return json(res, 202, { interrupt: runtime.interrupts.raise({
-      agentId: body.agentId ?? 'main',
+      agentId: resolveAgentId(body.agentId),
       goalId: body.goalId,
       targetTaskId: body.targetTaskId,
       kind: body.kind ?? 'external',
@@ -428,7 +534,7 @@ async function handleApi(req, res, url) {
     const tasks = runtime.store.listAllTasks({
       status: url.searchParams.get('status') ?? undefined,
       sessionId: url.searchParams.get('sessionId') ?? undefined,
-      limit: Number(url.searchParams.get('limit') ?? 100),
+      limit: queryInteger(url, 'limit', { fallback: 100, minimum: 1, maximum: 500 }),
     }).filter(ownsTask);
     return json(res, 200, { tasks });
   }
@@ -450,8 +556,8 @@ async function handleApi(req, res, url) {
     const audit = runtime.store.listAudit({
       goalId: url.searchParams.get('goalId') ?? undefined,
       taskId: url.searchParams.get('taskId') ?? undefined,
-      afterId: url.searchParams.has('afterId') ? Number(url.searchParams.get('afterId')) : undefined,
-      limit: Number(url.searchParams.get('limit') ?? 100),
+      afterId: url.searchParams.has('afterId') ? queryInteger(url, 'afterId', { fallback: undefined, minimum: 0, maximum: Number.MAX_SAFE_INTEGER }) : undefined,
+      limit: queryInteger(url, 'limit', { fallback: 100, minimum: 1, maximum: 500 }),
     }).filter((entry) => ownsGoal(runtime.store.getGoal(entry.goal_id)));
     return json(res, 200, { audit });
   }
@@ -460,16 +566,20 @@ async function handleApi(req, res, url) {
     const events = runtime.store.listEvents({
       topic: url.searchParams.get('topic') ?? undefined,
       correlationKey: url.searchParams.get('correlationKey') ?? undefined,
-      limit: Number(url.searchParams.get('limit') ?? 100),
+      limit: queryInteger(url, 'limit', { fallback: 100, minimum: 1, maximum: 500 }),
     }).filter((event) => !event.tenant_id || event.tenant_id === ownerTenantId);
     return json(res, 200, { events });
   }
 
   if (req.method === 'POST' && url.pathname === '/api/v1/messages') {
     const body = await readJson(req);
+    inputText(body.text, 'text', { maximum: config.session.maxMessageChars });
+    if (body.messageId != null) inputText(body.messageId, 'messageId', { maximum: 256, trim: false });
+    if (body.priority != null) inputNumber(body.priority, 'priority', { minimum: 0, maximum: 100 });
+    if (body.parentGoalId && !ownsGoal(runtime.store.getGoal(body.parentGoalId))) throw new HttpError(404, 'parent goal not found');
     const accepted = await runtime.submit({
       sessionKey: body.sessionKey,
-      agentId: body.agentId ?? 'main',
+      agentId: resolveAgentId(body.agentId),
       tenantId: resolveTenant(body),
       channel: body.channel ?? 'terminal',
       peerKey: body.peerKey ?? 'owner',
@@ -508,7 +618,7 @@ async function handleApi(req, res, url) {
   if (req.method === 'GET' && sessionMatch) {
     const session = runtime.store.getSession(decodeURIComponent(sessionMatch[1]));
     return ownsSession(session)
-      ? json(res, 200, { session, messages: runtime.store.listMessages(session.id, { limit: Number(url.searchParams.get('limit') ?? 100) }) })
+      ? json(res, 200, { session, messages: runtime.store.listMessages(session.id, { limit: queryInteger(url, 'limit', { fallback: 100, minimum: 1, maximum: 500 }) }) })
       : json(res, 404, { error: 'session not found' });
   }
 
@@ -518,9 +628,11 @@ async function handleApi(req, res, url) {
     const session = runtime.store.getSession(decodeURIComponent(sessionModelMatch[1]));
     if (!ownsSession(session)) return json(res, 404, { error: 'session not found' });
     const modelKey = body.modelKey == null || body.modelKey === '' ? null : String(body.modelKey);
+    if (modelKey && modelKey.length > 128) throw new HttpError(400, 'modelKey exceeds 128 characters');
     if (modelKey && !config.models[modelKey]) return json(res, 400, { error: `unknown model config: ${modelKey}` });
     const effectiveModelKey = modelKey ?? runtime.store.getAgent(session.agent_id)?.model_key;
     const modelId = body.modelId == null || body.modelId === '' ? null : String(body.modelId);
+    if (modelId && modelId.length > 256) throw new HttpError(400, 'modelId exceeds 256 characters');
     const effectiveModelId = modelId ?? config.models[effectiveModelKey]?.model;
     const updated = runtime.store.updateSessionMetadata(session.id, { modelKey, modelId });
     return json(res, 200, { session: updated, modelKey, modelId, effectiveModelKey, effectiveModelId });
@@ -538,20 +650,106 @@ async function handleApi(req, res, url) {
     return json(res, 200, {
       memories: url.searchParams.get('q')
         ? runtime.memory.recall(url.searchParams.get('agentId') ?? 'main', url.searchParams.get('q'), {
-            limit: Number(url.searchParams.get('limit') ?? 20), tenantId: ownerTenantId,
+            limit: queryInteger(url, 'limit', { fallback: 20, minimum: 1, maximum: 200 }), tenantId: ownerTenantId,
           })
-        : runtime.store.listMemories(url.searchParams.get('agentId') ?? 'main', Number(url.searchParams.get('limit') ?? 50), ownerTenantId),
+        : runtime.store.listMemories(url.searchParams.get('agentId') ?? 'main', queryInteger(url, 'limit', { fallback: 50, minimum: 1, maximum: 500 }), ownerTenantId),
     });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/memory-portability/providers') {
+    return json(res, 200, { providers: runtime.memoryPortability.listProviders() });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/memory-portability/runs') {
+    return json(res, 200, {
+      runs: runtime.store.listMemorySyncRuns({
+        agentId: resolveAgentId(url.searchParams.get('agentId') ?? 'main'),
+        tenantId: ownerTenantId,
+        providerId: url.searchParams.get('providerId') ?? undefined,
+        limit: queryInteger(url, 'limit', { fallback: 100, minimum: 1, maximum: 500 }),
+      }),
+    });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/memory-portability/export') {
+    const body = await readJson(req);
+    const result = runtime.memoryPortability.exportTracked({
+      agentId: resolveAgentId(body.agentId),
+      tenantId: resolveTenant(body),
+      includeInactive: body.includeInactive === true,
+      unsigned: body.unsigned === true,
+      limit: body.limit == null ? undefined : inputNumber(body.limit, 'limit', {
+        minimum: 1, maximum: config.memory.portability.maxEntries, integer: true,
+      }),
+      providerId: 'api',
+    });
+    return json(res, 200, {
+      bundle: result.bundle,
+      digest: result.digest,
+      contentDigest: result.contentDigest,
+      payloadDigest: result.payloadDigest,
+      encrypted: result.encrypted,
+      count: result.count,
+    });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/memory-portability/import') {
+    const body = await readJson(req, { maxBytes: Math.min(8_000_000, config.memory.portability.maxBundleBytes + 100_000) });
+    if (!body.bundle || typeof body.bundle !== 'object' || Array.isArray(body.bundle)) throw new HttpError(400, 'bundle must be an object');
+    let result;
+    try {
+      result = runtime.memoryPortability.importTracked(body.bundle, {
+        agentId: resolveAgentId(body.agentId),
+        tenantId: resolveTenant(body),
+        activate: body.activate === true,
+        remote: false,
+        providerId: 'api',
+      });
+    } catch (error) {
+      throw new HttpError(400, error instanceof Error ? error.message : String(error));
+    }
+    return json(res, 200, result);
+  }
+
+  const memoryProviderMatch = url.pathname.match(/^\/api\/memory-portability\/providers\/([^/]+)\/(pull|push)$/);
+  if (req.method === 'POST' && memoryProviderMatch) {
+    const providerId = decodeURIComponent(memoryProviderMatch[1]);
+    if (!runtime.memoryPortability.listProviders().some((provider) => provider.id === providerId)) {
+      return json(res, 404, { error: 'memory provider not found' });
+    }
+    const body = await readJson(req);
+    const options = {
+      agentId: resolveAgentId(body.agentId),
+      tenantId: resolveTenant(body),
+      activate: body.activate === true,
+      includeInactive: body.includeInactive === true,
+      digest: body.digest == null ? undefined : inputText(body.digest, 'digest', { maximum: 128 }),
+    };
+    let result;
+    try {
+      result = memoryProviderMatch[2] === 'pull'
+        ? await runtime.memoryPortability.pull(providerId, options)
+        : await runtime.memoryPortability.push(providerId, options);
+    } catch (error) {
+      throw new HttpError(422, error instanceof Error ? error.message : String(error));
+    }
+    return json(res, 200, result);
   }
 
   if (req.method === 'POST' && url.pathname === '/api/memories') {
     const body = await readJson(req);
+    inputText(body.content, 'content', { maximum: config.memory.maxEntryChars });
+    if (body.kind != null && !['fact', 'preference', 'decision', 'episode', 'procedure', 'note'].includes(body.kind)) throw new HttpError(400, 'invalid memory kind');
+    if (body.importance != null) inputNumber(body.importance, 'importance', { minimum: 0, maximum: 1 });
+    if (body.confidence != null) inputNumber(body.confidence, 'confidence', { minimum: 0, maximum: 1 });
+    if (body.tags != null && (!Array.isArray(body.tags) || body.tags.length > 50)) throw new HttpError(400, 'tags must be an array with at most 50 entries');
+    if (body.source != null) inputText(body.source, 'source', { maximum: 256 });
     return json(res, 201, { memory: runtime.memory.remember({
-      agentId: body.agentId ?? 'main', tenantId: resolveTenant(body), content: body.content, kind: body.kind,
+      agentId: resolveAgentId(body.agentId), tenantId: resolveTenant(body), content: body.content, kind: body.kind,
       importance: body.importance, confidence: body.confidence, tags: body.tags, source: body.source ?? 'api',
       expiresAt: body.expiresAt, validFrom: body.validFrom, validUntil: body.validUntil,
       supersedesId: body.supersedesId, contradictsIds: body.contradictsIds,
-      provenance: { actor: body.actor ?? 'api', evidence: body.evidence ?? null },
+      provenance: { actor: 'gateway-operator', evidence: body.evidence ?? null },
     }) });
   }
 
@@ -560,6 +758,7 @@ async function handleApi(req, res, url) {
     const body = await readJson(req);
     const memory = runtime.store.getMemory(decodeURIComponent(memoryConfirmMatch[1]));
     if (!memory || memory.tenant_id !== ownerTenantId) return json(res, 404, { error: 'memory not found' });
+    if (body.confidence != null) inputNumber(body.confidence, 'confidence', { minimum: 0, maximum: 1 });
     return json(res, 200, { memory: runtime.memory.confirm(memory.id, {
       confidence: body.confidence,
       source: body.source ?? 'operator',
@@ -574,7 +773,7 @@ async function handleApi(req, res, url) {
     const status = String(body.status ?? '').toUpperCase();
     if (!['ACTIVE', 'RETRACTED', 'CONTRADICTED'].includes(status)) return json(res, 400, { error: 'invalid memory status' });
     return json(res, 200, { memory: runtime.store.setMemoryStatus(memory.id, status, {
-      actor: body.actor ?? 'operator', reason: body.reason ?? null,
+      actor: 'gateway-operator', reason: body.reason ?? null,
     }) });
   }
 
@@ -595,24 +794,28 @@ async function handleApi(req, res, url) {
   const approvalMatch = url.pathname.match(/^\/api\/approvals\/([^/]+)\/resolve$/);
   if (req.method === 'POST' && approvalMatch) {
     const body = await readJson(req);
+    if (!['approve', 'deny'].includes(body.decision)) throw new HttpError(400, 'decision must be approve or deny');
+    if (body.note != null) inputText(body.note, 'note', { maximum: 4_000, required: false });
     const approvalId = decodeURIComponent(approvalMatch[1]);
     const current = runtime.store.getApproval(approvalId);
     if (!current || !ownsGoal(runtime.store.getGoal(current.goal_id))) return json(res, 404, { error: 'approval not found' });
-    const approval = runtime.store.resolveApproval(approvalId, body.decision, {
-      resolvedBy: body.resolvedBy ?? 'owner', note: body.note,
-    });
-    const delivery = runtime.publishEvent({
-      topic: 'approval.resolved',
-      correlationKey: approval.id,
-      payload: { decision: body.decision, status: approval.status, note: body.note },
+    let outcome;
+    try {
+      outcome = runtime.store.resolveApprovalAndPublishEvent(approvalId, body.decision, {
+        resolvedBy: 'gateway-operator', note: body.note,
+      }, {
       source: 'approval-api',
-      idempotencyKey: `approval-resolution:${approval.id}`,
-      tenantId: runtime.store.getGoal(approval.goal_id)?.tenant_id,
-      agentId: runtime.store.getGoal(approval.goal_id)?.agent_id,
+      tenantId: runtime.store.getGoal(current.goal_id)?.tenant_id,
+      agentId: runtime.store.getGoal(current.goal_id)?.agent_id,
       authenticated: true,
-      authSubject: body.resolvedBy ?? 'owner',
-    });
-    return json(res, 200, { approval, delivery });
+      authSubject: 'gateway-operator',
+      });
+    } catch (error) {
+      throw new HttpError(409, error.message);
+    }
+    runtime.eventBus.announce(outcome.delivery);
+    runtime.scheduler.requestDrain();
+    return json(res, 200, outcome);
   }
 
   if (req.method === 'GET' && url.pathname === '/api/schedules') {
@@ -633,12 +836,24 @@ async function handleApi(req, res, url) {
   if (req.method === 'POST' && url.pathname === '/api/monitors') {
     const body = await readJson(req);
     if (!runtime.sensors.get(body.sensorType)) return json(res, 400, { error: 'unknown sensor type' });
-    const intervalMs = Number(body.intervalMs ?? Number(body.intervalSeconds) * 1000);
-    if (!Number.isFinite(intervalMs) || intervalMs < 1_000) return json(res, 400, { error: 'monitor interval must be at least one second' });
+    const name = inputText(body.name, 'name', { maximum: 500 });
+    const intervalMs = inputNumber(body.intervalMs ?? Number(body.intervalSeconds) * 1000, 'monitor interval', {
+      minimum: 1_000, maximum: 31_536_000_000, integer: true,
+    });
+    if (!body.config || typeof body.config !== 'object' || Array.isArray(body.config)) throw new HttpError(400, 'monitor config must be an object');
+    if (body.sensorType === 'https') {
+      const monitorUrl = inputText(body.config.url, 'config.url', { maximum: 8_192 });
+      let parsed;
+      try { parsed = new URL(monitorUrl); } catch { throw new HttpError(400, 'config.url must be a valid HTTPS URL'); }
+      if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.port && parsed.port !== '443') {
+        throw new HttpError(400, 'config.url must use HTTPS port 443 without embedded credentials');
+      }
+      body.config.url = monitorUrl;
+    }
     return json(res, 201, { monitor: runtime.store.createMonitor({
-      agentId: body.agentId ?? 'main',
+      agentId: resolveAgentId(body.agentId),
       tenantId: resolveTenant(body),
-      name: body.name,
+      name,
       sensorType: body.sensorType,
       intervalMs,
       config: body.config ?? {},
@@ -672,12 +887,16 @@ async function handleApi(req, res, url) {
   if (req.method === 'POST' && url.pathname === '/api/schedules') {
     const body = await readJson(req);
     if (body.sessionId && !ownsSession(runtime.store.getSession(body.sessionId))) return json(res, 404, { error: 'session not found' });
+    const name = inputText(body.name, 'name', { maximum: 500 });
+    const objective = inputText(body.objective, 'objective', { maximum: 200_000 });
     const nextRunAt = new Date(body.runAt).getTime();
     if (!Number.isFinite(nextRunAt)) return json(res, 400, { error: 'runAt is invalid' });
     return json(res, 201, { schedule: runtime.store.createSchedule({
-      agentId: body.agentId ?? 'main', tenantId: resolveTenant(body), name: body.name, nextRunAt,
-      intervalMs: body.intervalMinutes ? Number(body.intervalMinutes) * 60_000 : null,
-      payload: { objective: body.objective, sessionId: body.sessionId },
+      agentId: resolveAgentId(body.agentId), tenantId: resolveTenant(body), name, nextRunAt,
+      intervalMs: body.intervalMinutes == null ? null : inputNumber(body.intervalMinutes, 'intervalMinutes', {
+        minimum: 1, maximum: 525_600, integer: true,
+      }) * 60_000,
+      payload: { objective, sessionId: body.sessionId },
     }) });
   }
 
@@ -708,10 +927,11 @@ async function handleApi(req, res, url) {
   const taskPriorityMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/priority$/);
   if (req.method === 'POST' && taskPriorityMatch) {
     const body = await readJson(req);
+    inputNumber(body.priority, 'priority', { minimum: 0, maximum: 100 });
     const taskId = decodeURIComponent(taskPriorityMatch[1]);
     const current = runtime.store.getTask(taskId);
     if (!ownsTask(current)) return json(res, 404, { error: 'task not found' });
-    const task = runtime.store.updateTaskPriority(taskId, body.priority, body.actor ?? 'owner', body.reason);
+    const task = runtime.store.updateTaskPriority(taskId, body.priority, 'gateway-operator', body.reason);
     runtime.scheduler.requestDrain();
     return json(res, 200, { task, explanation: runtime.observability.explainTask(task) });
   }
@@ -728,8 +948,9 @@ async function handleApi(req, res, url) {
 
   if (req.method === 'POST' && url.pathname === '/api/goals') {
     const body = await readJson(req);
-    const objective = String(body.objective ?? '').trim();
-    if (!objective) return json(res, 400, { error: 'objective is required' });
+    const objective = inputText(body.objective, 'objective', { maximum: 200_000 });
+    if (body.priority != null) inputNumber(body.priority, 'priority', { minimum: 0, maximum: 100 });
+    if (body.parentGoalId && !ownsGoal(runtime.store.getGoal(body.parentGoalId))) throw new HttpError(404, 'parent goal not found');
     const view = await runtime.createGoal(objective, {
       requireReply: body.requireReply !== false,
       replyTimeoutMs: body.replyTimeoutMs,
@@ -743,7 +964,8 @@ async function handleApi(req, res, url) {
       resourceClaims: body.resourceClaims,
       assumptions: body.assumptions,
       capabilityExpiresAt: body.capabilityExpiresAt,
-      agentId: body.agentId,
+      parentGoalId: body.parentGoalId,
+      agentId: resolveAgentId(body.agentId),
       tenantId: resolveTenant(body),
     });
     return json(res, 201, view);
@@ -790,7 +1012,7 @@ async function handleApi(req, res, url) {
     const goalId = decodeURIComponent(goalBudgetMatch[1]);
     if (!ownsGoal(runtime.store.getGoal(goalId))) return json(res, 404, { error: 'goal not found' });
     const contract = runtime.resources.reviseBudget(goalId, body.budget ?? {}, {
-      actor: body.actor ?? 'owner',
+      actor: 'gateway-operator',
       reason: body.reason ?? 'Budget revised from control API',
     });
     runtime.scheduler.requestDrain();
@@ -804,7 +1026,7 @@ async function handleApi(req, res, url) {
     if (!ownsGoal(runtime.store.getGoal(goalId))) return json(res, 404, { error: 'goal contract not found' });
     const contract = runtime.capabilities.revoke(
       goalId,
-      body.actor ?? 'owner',
+      'gateway-operator',
       body.reason,
     );
     return contract ? json(res, 200, { contract }) : json(res, 404, { error: 'goal contract not found' });
@@ -815,8 +1037,8 @@ async function handleApi(req, res, url) {
     const goal = runtime.store.getGoal(decodeURIComponent(replyMatch[1]));
     if (!ownsGoal(goal)) return json(res, 404, { error: 'goal not found' });
     const body = await readJson(req);
-    const message = String(body.message ?? '').trim();
-    if (!message) return json(res, 400, { error: 'message is required' });
+    const message = inputText(body.message, 'message', { maximum: config.session.maxMessageChars });
+    if (body.idempotencyKey != null) inputText(body.idempotencyKey, 'idempotencyKey', { maximum: 512, trim: false });
     const waiting = runtime.store.listTasks(goal.id).find((task) => (
       task.status === 'WAITING'
       && task.wait_kind === 'EVENT'
@@ -825,17 +1047,23 @@ async function handleApi(req, res, url) {
     const topic = waiting?.wait_topic ?? goal.metadata.replyTopic;
     const correlationKey = waiting?.wait_key ?? goal.metadata.replyKey;
     if (!topic || !correlationKey) return json(res, 409, { error: 'goal is not waiting for an external reply' });
-    const result = runtime.publishEvent({
-      topic,
-      correlationKey,
-      payload: { message, receivedAt: Date.now() },
-      source: 'control-api',
-      idempotencyKey: body.idempotencyKey,
-      tenantId: goal.tenant_id,
-      agentId: goal.agent_id,
-      authenticated: true,
-      authSubject: 'owner',
-    });
+    let result;
+    try {
+      result = runtime.publishEvent({
+        topic,
+        correlationKey,
+        payload: { message },
+        source: 'control-api',
+        idempotencyKey: body.idempotencyKey,
+        tenantId: goal.tenant_id,
+        agentId: goal.agent_id,
+        authenticated: true,
+        authSubject: 'gateway-operator',
+      });
+    } catch (error) {
+      if (String(error.message).includes('replay key was reused')) throw new HttpError(409, error.message);
+      throw error;
+    }
     return json(res, 202, result);
   }
 
@@ -844,59 +1072,104 @@ async function handleApi(req, res, url) {
     if (!body.topic || !body.correlationKey) {
       return json(res, 400, { error: 'topic and correlationKey are required' });
     }
+    if (INTERNAL_EVENT_TOPICS.has(String(body.topic))) throw new HttpError(403, 'event topic is reserved for the Agent OS kernel');
     const source = String(body.source ?? 'api');
-    const authentication = runtime.eventAuthenticator.verify({
-      source,
-      topic: String(body.topic),
-      correlationKey: String(body.correlationKey),
-      payload: body.payload ?? {},
-      tenantId: resolveTenant(body),
-      agentId: body.agentId ?? 'main',
-      timestamp: body.timestamp,
-      nonce: body.nonce,
-      signature: body.signature ?? req.headers['x-agent-event-signature'],
-    });
-    return json(res, 202, runtime.publishEvent({
-      topic: String(body.topic),
-      correlationKey: String(body.correlationKey),
-      payload: body.payload ?? {},
-      source,
-      idempotencyKey: body.idempotencyKey,
-      tenantId: resolveTenant(body),
-      agentId: body.agentId ?? 'main',
-      nonce: authentication.nonce,
-      authenticated: authentication.authenticated,
-      authSubject: authentication.authSubject,
-    }));
+    const tenantId = resolveTenant(body);
+    const agentId = resolveAgentId(body.agentId);
+    if (body.idempotencyKey != null) inputText(body.idempotencyKey, 'idempotencyKey', { maximum: 512, trim: false });
+    let authentication;
+    try {
+      authentication = runtime.eventAuthenticator.verify({
+        source,
+        topic: String(body.topic),
+        correlationKey: String(body.correlationKey),
+        payload: body.payload ?? {},
+        tenantId,
+        agentId,
+        timestamp: body.timestamp,
+        nonce: body.nonce,
+        signature: body.signature ?? req.headers['x-agent-event-signature'],
+      });
+    } catch {
+      throw new HttpError(401, 'external event authentication failed');
+    }
+    try {
+      return json(res, 202, runtime.publishEvent({
+        topic: String(body.topic),
+        correlationKey: String(body.correlationKey),
+        payload: body.payload ?? {},
+        source,
+        idempotencyKey: body.idempotencyKey,
+        tenantId,
+        agentId,
+        nonce: authentication.nonce,
+        authenticated: authentication.authenticated,
+        authSubject: authentication.authSubject,
+      }));
+    } catch (error) {
+      if (String(error.message).includes('replay key was reused')) throw new HttpError(409, error.message);
+      throw error;
+    }
   }
 
   if (req.method === 'GET' && url.pathname === '/api/stream') {
+    if (sseClients.size >= 32) return json(res, 503, { error: 'stream connection limit reached' });
     res.writeHead(200, {
       'content-type': 'text/event-stream',
       'cache-control': 'no-cache, no-transform',
       connection: 'keep-alive',
       'x-accel-buffering': 'no',
+      'x-content-type-options': 'nosniff',
+      'referrer-policy': 'no-referrer',
+      'cross-origin-resource-policy': 'same-origin',
     });
-    res.write(`event: connected\ndata: ${JSON.stringify({ workerId: runtime.scheduler.workerId })}\n\n`);
-    const onChange = (update) => res.write(`event: runtime\ndata: ${JSON.stringify(update)}\n\n`);
-    const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), 15_000);
-    runtime.eventBus.on('change', onChange);
-    req.on('close', () => {
+    sseClients.add(res);
+    let closed = false;
+    let heartbeat;
+    const cleanup = () => {
+      if (closed) return;
+      closed = true;
       clearInterval(heartbeat);
       runtime.eventBus.off('change', onChange);
-    });
+      sseClients.delete(res);
+    };
+    const write = (chunk) => {
+      if (closed || res.destroyed) return false;
+      if (Buffer.byteLength(chunk) > 256_000 || !res.write(chunk)) {
+        cleanup();
+        res.destroy();
+        return false;
+      }
+      return true;
+    };
+    const onChange = (update) => write(`event: runtime\ndata: ${JSON.stringify(update)}\n\n`);
+    write(`event: connected\ndata: ${JSON.stringify({ workerId: runtime.scheduler.workerId })}\n\n`);
+    heartbeat = setInterval(() => write(': heartbeat\n\n'), 15_000);
+    runtime.eventBus.on('change', onChange);
+    req.on('close', cleanup);
     return;
   }
 
   return json(res, 404, { error: 'not found' });
 }
 
-const server = createServer(async (req, res) => {
+const server = createServer({ maxHeaderSize: 16_384, requestTimeout: 35_000, headersTimeout: 10_000 }, async (req, res) => {
+  const requestId = randomUUID();
+  const requestPath = String(req.url ?? '').split('?', 1)[0];
+  res.setHeader('x-request-id', requestId);
   try {
-    const url = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
+    const url = new URL(req.url, 'http://agent-os.invalid');
     if (url.pathname.startsWith('/api/')) {
-      if (!isAuthorized(req, url)) return json(res, 401, { error: 'unauthorized' });
-      if (isRateLimited(req)) return json(res, 429, { error: 'rate limit exceeded' });
+      const authorization = authorizeGatewayRequest(req, config, authLimiter);
+      if (!authorization.ok) {
+        if (authorization.retryAfterMs) res.setHeader('retry-after', String(Math.ceil(authorization.retryAfterMs / 1_000)));
+        return json(res, authorization.status, { error: authorization.status === 429 ? 'rate limit exceeded' : 'unauthorized' });
+      }
+      const rateLimit = isRateLimited(req);
+      if (rateLimit) {
+        if (rateLimit.retryAfterMs) res.setHeader('retry-after', String(Math.ceil(rateLimit.retryAfterMs / 1_000)));
+        return json(res, 429, { error: 'rate limit exceeded' });
+      }
       return await handleApi(req, res, url);
     }
     if (req.method === 'GET' && url.pathname === '/') {
@@ -909,21 +1182,64 @@ const server = createServer(async (req, res) => {
     }
     return json(res, 404, { error: 'not found' });
   } catch (error) {
-    console.error(error);
-    return json(res, error instanceof SyntaxError ? 400 : 500, { error: error.message });
+    const status = error instanceof HttpError || error instanceof URIError
+      ? (error.status ?? 400)
+      : error?.code === 'CAPABILITY_DENIED'
+        ? 403
+        : error?.code === 'RESOURCE_LIMIT'
+          ? 422
+          : 500;
+    console.error(JSON.stringify({
+      level: 'error', requestId, method: req.method, path: requestPath,
+      error: error instanceof Error ? error.stack : String(error),
+    }));
+    return json(res, status, {
+      error: status >= 500 ? 'internal server error' : error.message,
+      requestId,
+    });
   }
 });
+server.keepAliveTimeout = 5_000;
+server.maxRequestsPerSocket = 1_000;
+server.maxConnections = 128;
 
-server.listen(port, config.gateway.bind, () => {
-  console.log(`Agent OS headless gateway is running at http://${config.gateway.bind}:${port}`);
-});
-
-function shutdown() {
-  server.close(async () => {
-    await runtime.stop();
-    process.exit(0);
+await new Promise((resolveListen, rejectListen) => {
+  const onError = (error) => rejectListen(error);
+  server.once('error', onError);
+  server.listen(port, config.gateway.bind, () => {
+    server.off('error', onError);
+    resolveListen();
   });
+}).catch(async (error) => {
+  await runtime.stop();
+  throw error;
+});
+console.log(`Agent OS headless gateway is running at http://${config.gateway.bind}:${port}`);
+
+let shuttingDown = false;
+async function shutdown(exitCode = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  process.exitCode = exitCode;
+  const force = setTimeout(() => {
+    server.closeAllConnections?.();
+    process.exit(exitCode || 1);
+  }, 10_000);
+  force.unref();
+  server.closeIdleConnections?.();
+  server.closeAllConnections?.();
+  await new Promise((resolveClose) => server.close(resolveClose));
+  await runtime.stop();
+  clearTimeout(force);
 }
 
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+process.on('SIGINT', () => void shutdown(0));
+process.on('SIGTERM', () => void shutdown(0));
+process.on('uncaughtException', (error) => {
+  console.error(error);
+  void shutdown(1);
+});
+process.on('unhandledRejection', (error) => {
+  console.error(error);
+  void shutdown(1);
+});

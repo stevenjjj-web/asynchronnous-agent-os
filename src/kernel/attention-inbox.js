@@ -132,7 +132,7 @@ export class AttentionInbox {
     const result = this.publishEvent({
       topic: task.wait_topic,
       correlationKey: task.wait_key,
-      payload: { message: text, receivedAt: Date.now() },
+      payload: { message: text },
       source: 'attention-inbox',
       idempotencyKey: idempotencyKey ?? `attention-reply:${task.id}:${Date.now()}`,
       tenantId: goal.tenant_id,

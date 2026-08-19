@@ -1,5 +1,12 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import {
+  appendPrivateFile,
+  atomicWritePrivateFile,
+  ensureDirectoryWithinRoot,
+  readPrivateTextFile,
+  resolveWithinRoot,
+} from '../platform/fs-safety.js';
 
 const MEMORY_KINDS = new Set(['fact', 'preference', 'decision', 'episode', 'procedure', 'note']);
 
@@ -24,6 +31,8 @@ export class MemoryService {
     if (!content) throw new Error('Memory content is required');
     const kind = input.kind ?? 'fact';
     if (!MEMORY_KINDS.has(kind)) throw new Error(`Unsupported memory kind: ${kind}`);
+    const status = input.status ?? 'ACTIVE';
+    if (!['ACTIVE', 'CANDIDATE'].includes(status)) throw new Error(`Unsupported initial memory status: ${status}`);
     for (const field of ['importance', 'confidence']) {
       if (input[field] != null && (!Number.isFinite(Number(input[field])) || Number(input[field]) < 0 || Number(input[field]) > 1)) {
         throw new Error(`${field} must be a number between 0 and 1`);
@@ -31,6 +40,12 @@ export class MemoryService {
     }
     if (input.tags != null && (!Array.isArray(input.tags) || input.tags.length > 50)) {
       throw new Error('Memory tags must be an array with at most 50 entries');
+    }
+    if ((input.tags ?? []).some((tag) => typeof tag !== 'string' || !tag || tag.length > 100)) {
+      throw new Error('Memory tags must contain 1 to 100 characters');
+    }
+    if (input.source != null && (typeof input.source !== 'string' || !input.source || input.source.length > 256)) {
+      throw new Error('Memory source must contain 1 to 256 characters');
     }
     const maxChars = this.config.memory.maxEntryChars ?? 12_000;
     if (content.length > maxChars) throw new Error(`Memory exceeds ${maxChars} characters`);
@@ -45,24 +60,34 @@ export class MemoryService {
       }
       return existing;
     }
+    const expiresAt = timestamp(input.expiresAt, 'expiresAt');
+    const validFrom = timestamp(input.validFrom, 'validFrom');
+    const validUntil = timestamp(input.validUntil, 'validUntil');
+    if (validFrom != null && validUntil != null && validUntil <= validFrom) throw new Error('validUntil must be later than validFrom');
     const memory = this.store.addMemory({
       ...input,
       agentId: agent.id,
       tenantId: input.tenantId ?? 'default',
       content,
       kind,
-      expiresAt: timestamp(input.expiresAt, 'expiresAt'),
-      validFrom: timestamp(input.validFrom, 'validFrom'),
-      validUntil: timestamp(input.validUntil, 'validUntil'),
+      status,
+      expiresAt,
+      validFrom,
+      validUntil,
     });
 
-    const date = new Date().toISOString().slice(0, 10);
-    const directory = join(agent.workspace, 'memory');
-    mkdirSync(directory, { recursive: true });
-    appendFileSync(
+    this.mirrorMemory(memory);
+    return memory;
+  }
+
+  mirrorMemory(memory) {
+    const agent = this.store.getAgent(memory.agent_id);
+    if (!agent) throw new Error(`Unknown agent: ${memory.agent_id}`);
+    const date = new Date(memory.created_at).toISOString().slice(0, 10);
+    const directory = ensureDirectoryWithinRoot(agent.workspace, 'memory');
+    appendPrivateFile(
       join(directory, `${date}.md`),
-      `\n- ${new Date(memory.created_at).toISOString()} [${memory.kind}] [id=${memory.id}] [confidence=${memory.confidence}] [source=${memory.source}] ${content.replaceAll('\n', ' ')}\n`,
-      'utf8',
+      `\n- ${new Date(memory.created_at).toISOString()} [${memory.status}] [${memory.kind}] [id=${memory.id}] [confidence=${memory.confidence}] [source=${memory.source}] ${memory.content.replaceAll('\n', ' ')}\n`,
     );
     return memory;
   }
@@ -76,14 +101,13 @@ export class MemoryService {
     const diary = join(agent.workspace, 'memory', `${date}.md`);
     if (existsSync(diary)) {
       const flattened = memory.content.replaceAll('\n', ' ');
-      const lines = readFileSync(diary, 'utf8').split('\n');
+      const safeDiary = resolveWithinRoot(agent.workspace, `memory/${date}.md`);
+      const lines = readPrivateTextFile(safeDiary, { maxBytes: 5_000_000 }).split('\n');
       const retained = lines.filter((line) => (
         !line.includes(`[id=${memory.id}]`)
         && !line.includes(`[${memory.kind}] ${flattened}`)
       ));
-      const temporary = `${diary}.${process.pid}.tmp`;
-      writeFileSync(temporary, retained.join('\n'), 'utf8');
-      renameSync(temporary, diary);
+      atomicWritePrivateFile(safeDiary, retained.join('\n'));
     }
     return memory;
   }
@@ -103,6 +127,9 @@ export class MemoryService {
   }
 
   confirm(id, input = {}) {
+    if (input.confidence != null && (!Number.isFinite(Number(input.confidence)) || Number(input.confidence) < 0 || Number(input.confidence) > 1)) {
+      throw new Error('confidence must be a number between 0 and 1');
+    }
     return this.store.confirmMemory(id, input);
   }
 }

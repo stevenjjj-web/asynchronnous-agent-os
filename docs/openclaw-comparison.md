@@ -46,16 +46,16 @@ The defining invariant is:
 | Guided onboarding | Model/provider, masked or referenced credentials, workspace, gateway exposure, budgets, cognition, and approvals |
 | Live operator surface | Animated product mascot plus a fixed terminal dashboard for threads, goals, attention, memory, and resource pools |
 | Agents and workspaces | Multiple agents, isolated workspaces, bootstrap identity and memory files |
-| Sessions and messages | SQLite routing, provenance, idempotent inbound message ids |
+| Sessions and messages | SQLite routing, ownership checks, provenance, idempotent inbound message ids, and atomic message/Goal creation |
 | Persistent kernel | Goal and task DAGs, lifecycle state machine, dependency unlocking |
 | Scheduling | Global ready queue, bounded concurrency, leases, renewal, recovery, fairness quantum |
 | Resource governance | Atomic goal contracts, token/cost/time/tool/context/fan-out budgets, daily quotas, deadline urgency, and isolated capacity pools |
 | Capability security | Frozen per-goal authority, child subset inheritance, scoped files/domains/accounts/data/credentials, expiry, revocation, and audit |
 | Tool loop | JSON Schema validation, allow/deny policy, risk levels, hooks, bounded rounds |
-| Sandboxed execution boundary | Browser/code tools cannot register without a named sandbox adapter; adapters are plugin-provided trusted worker boundaries |
+| Sandboxed execution boundary | Browser/code tools require a trusted adapter declaring process, container, or microVM isolation; no built-in sandbox backend is claimed |
 | Suspend and resume | Workflow snapshots and model tool-call state persist across waits and restarts |
 | Dynamic fan-out | Child session goals and `goal.completed` event convergence |
-| Memory | Explicit capture policy, SQLite FTS5, id-addressable Markdown mirror, selective recall, and deletion |
+| Memory | Explicit capture policy, SQLite FTS5, id-addressable Markdown mirror, selective recall, deletion, signed content-addressed bundles, candidate imports, and resident snapshot/CAS synchronization |
 | Data lifecycle | Clean context switching, terminal-session purge, separate long-term-memory deletion, and schedule detachment |
 | Approvals | Durable records and approval events for high-risk tools |
 | Automation | One-time and interval schedules that create persistent goals |
@@ -63,9 +63,9 @@ The defining invariant is:
 | Attention and preemption | Durable interrupts, cooperative abort signals, priority scheduling, and checkpoint resume |
 | Idle cognition | Always-resident attention allocator with value/cost scoring, opt-in bounded model reflection, and critical interrupts |
 | Side-effect safety | Durable prepare/execute/confirm/reconcile records, uncertain outcomes, compensation, non-idempotent isolation, and atomic message/outbox commit |
-| Reliable delivery | SQLite outbox, idempotency, retry backoff, channel registry |
+| Reliable delivery | SQLite outbox, mandatory adapter idempotency contract, collision checks, retry backoff, channel registry |
 | Inbound channel waiting | Supervised push adapters, durable message ingress, replay-safe event conversion, exact correlation resume |
-| Plugins | Explicit allowlisted paths for tools, actions, channels, hooks, sensors, and resident listeners |
+| Plugins | Canonical private operator-owned paths, optional exact ID allowlist, and fail-closed loading for trusted in-process extensions |
 | Auditability | Append-only task ledger, durable events, observations, and CLI log streaming |
 
 ## Deliberate gaps

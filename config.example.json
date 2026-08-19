@@ -66,20 +66,21 @@
   "security": {
     "tenantId": "default",
     "secretFile": "./data/secrets.json",
-    "approvalRisk": "high",
+    "approvalRisk": "medium",
     "allowRemoteWithoutAuth": false,
-    "allowLocalBypass": true,
+    "allowLocalBypass": false,
     "pluginPaths": [],
+    "plugins": { "failClosed": true, "allowIds": [], "requirePrivateFiles": true },
     "tools": {
-      "allow": ["*"],
+      "allow": ["memory_search", "memory_remember", "memory_confirm", "plan_assume", "workspace_list", "workspace_read", "workspace_write", "request_user_input", "wait_for_event", "wait_for_channel", "sleep", "spawn_goals", "schedule_goal", "goal_status", "create_monitor", "monitor_status", "kernel_status"],
       "deny": []
     },
     "capabilities": {
-      "tools": ["*"],
-      "resourcePools": ["*"],
-      "filesystem": { "roots": ["."], "operations": ["list", "read", "write", "delete"] },
-      "network": { "domains": ["*"], "methods": ["GET"] },
-      "accounts": { "channel": ["*"] },
+      "tools": ["memory_search", "memory_remember", "memory_confirm", "plan_assume", "workspace_list", "workspace_read", "workspace_write", "request_user_input", "wait_for_event", "wait_for_channel", "sleep", "spawn_goals", "schedule_goal", "goal_status", "create_monitor", "monitor_status", "kernel_status"],
+      "resourcePools": ["default", "memory", "filesystem"],
+      "filesystem": { "roots": ["."], "operations": ["list", "read", "write"] },
+      "network": { "domains": [], "methods": [] },
+      "accounts": {},
       "dataScopes": ["agent:self"],
       "credentialRefs": [],
       "constraints": {}
@@ -106,6 +107,7 @@
       "apiKeyRef": null,
       "model": "gpt-4.1-mini",
       "timeoutMs": 90000,
+      "allowPrivateNetwork": false,
       "inputCostPerMillion": 0,
       "outputCostPerMillion": 0
     }
@@ -113,7 +115,24 @@
   "memory": {
     "captureMode": "explicit",
     "maxRecallEntries": 8,
-    "maxEntryChars": 12000
+    "maxEntryChars": 12000,
+    "portability": {
+      "pollMs": 30000,
+      "maxConcurrentSyncs": 2,
+      "maxSyncHistory": 5000,
+      "maxBundleBytes": 4000000,
+      "maxEntries": 5000,
+      "maxImportedConfidence": 0.6,
+      "requireSignatureForRemote": true,
+      "encryption": {
+        "requireForRemote": true,
+        "activeKeyId": null,
+        "keys": {}
+      },
+      "signer": null,
+      "trustedSigners": {},
+      "providers": {}
+    }
   },
   "onboarding": {
     "completedAt": null,

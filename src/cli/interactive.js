@@ -509,6 +509,26 @@ async function handleSlashCommand(input, { client, format, stdout, dashboard, se
       { label: 'CONF', value: (memory) => Number(memory.confidence).toFixed(2), max: 5 },
       { label: 'ID', value: (memory) => memory.id, max: 36 },
     ])}\n`);
+  } else if (command === 'memory-sync') {
+    const [{ providers }, { runs }] = await Promise.all([
+      client.get('/api/memory-portability/providers'),
+      client.get('/api/memory-portability/runs?limit=20'),
+    ]);
+    stdout.write(`${format.bold('Memory providers')}\n${table(providers, [
+      { label: 'PROVIDER', value: (item) => item.id, max: 24 },
+      { label: 'TYPE', value: (item) => item.type, max: 16 },
+      { label: 'REMOTE', value: (item) => item.remote ? 'yes' : 'no', max: 6 },
+      { label: 'SIGNED', value: (item) => item.signatureRequired ? 'required' : '-', max: 8 },
+      { label: 'CRYPT', value: (item) => item.encryptionRequired ? 'required' : '-', max: 8 },
+      { label: 'AUTO PULL', value: (item) => item.pullIntervalMs ?? '-', max: 12 },
+      { label: 'AUTO PUSH', value: (item) => item.pushIntervalMs ?? '-', max: 12 },
+    ])}\n\n${format.bold('Recent sync runs')}\n${table(runs, [
+      { label: 'STATUS', value: (item) => item.status, max: 10 },
+      { label: 'DIRECTION', value: (item) => item.direction, max: 9 },
+      { label: 'PROVIDER', value: (item) => item.provider_id, max: 20 },
+      { label: 'DIGEST', value: (item) => item.bundle_digest ?? '-', max: 24 },
+      { label: 'WHEN', value: (item) => relativeTime(item.started_at), max: 12 },
+    ])}\n`);
   } else if (command === 'approvals') {
     const { approvals } = await client.get('/api/approvals?status=PENDING');
     stdout.write(`${table(approvals, [
@@ -547,6 +567,14 @@ async function handleSlashCommand(input, { client, format, stdout, dashboard, se
       { label: 'WAKE', value: (item) => item.decision.shouldWake ? 'yes' : 'no', max: 5 },
       { label: 'REASON', value: (item) => item.decision.reason, max: 32 },
       { label: 'WHEN', value: (item) => relativeTime(item.created_at), max: 12 },
+    ])}\n`);
+  } else if (command === 'security') {
+    const result = await client.get('/api/security/audit');
+    stdout.write(`${format.bold('Security audit')} · ${result.summary.critical} critical · ${result.summary.high} high · ${result.summary.warning} warning\n`);
+    stdout.write(`${table(result.findings, [
+      { label: 'LEVEL', value: (item) => item.severity.toUpperCase(), max: 8 },
+      { label: 'CHECK', value: (item) => item.id, max: 32 },
+      { label: 'FINDING', value: (item) => item.title, max: 68 },
     ])}\n`);
   } else {
     stdout.write(format.yellow(`Unknown command: /${command}\n`));

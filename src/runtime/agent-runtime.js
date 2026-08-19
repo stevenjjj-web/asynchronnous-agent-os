@@ -35,6 +35,11 @@ export class AgentRuntime {
       plan.goal.tenantId = options.contract.tenantId;
       plan.goal.deadlineAt = options.contract.deadlineAt;
       plan.goal.agentId = options.contract.agentId;
+      plan.goal.metadata = {
+        ...plan.goal.metadata,
+        parentGoalId: options.contract.parentGoalId ?? null,
+        spawnDepth: Number(options.spawnDepth ?? 0),
+      };
     }
     const created = this.store.createGoalWithTasks(plan.goal, plan.tasks);
     this.eventBus.emit('change', {

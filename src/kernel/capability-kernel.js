@@ -235,6 +235,15 @@ export class CapabilityKernel {
     return contract;
   }
 
+  canExposeTool(goalId, tool) {
+    const contract = this.store.getGoalContract(goalId);
+    if (!contract || contract.capability_status !== 'ACTIVE') return false;
+    if (contract.capability_expires_at && Date.now() >= contract.capability_expires_at) return false;
+    const capabilities = contract.capabilities ?? {};
+    return allows(list(capabilities.tools), tool.name)
+      && allows(list(capabilities.resourcePools), tool.resourcePool);
+  }
+
   deny(goalId, message, detail = {}) {
     this.store.appendCapabilityAudit(goalId, 'DENIED', 'kernel', { message, ...detail });
     throw new CapabilityError(message, detail);

@@ -6,7 +6,10 @@ export class SandboxRegistry {
   register(name, adapter) {
     if (!name || typeof adapter?.execute !== 'function') throw new Error('A sandbox adapter requires a name and execute function');
     if (this.adapters.has(name)) throw new Error(`Sandbox adapter already registered: ${name}`);
-    this.adapters.set(name, { name, description: '', ...adapter });
+    if (adapter.isolation && !['process', 'container', 'microvm'].includes(adapter.isolation)) {
+      throw new Error(`Unsupported sandbox isolation level: ${adapter.isolation}`);
+    }
+    this.adapters.set(name, { name, description: '', isolation: 'none', ...adapter });
     return this;
   }
 
@@ -16,6 +19,10 @@ export class SandboxRegistry {
 
   has(name) {
     return this.adapters.has(name);
+  }
+
+  isStrong(name) {
+    return ['process', 'container', 'microvm'].includes(this.adapters.get(name)?.isolation);
   }
 
   async run(name, input) {

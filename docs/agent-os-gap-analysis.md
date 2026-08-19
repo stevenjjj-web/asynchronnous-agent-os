@@ -4,7 +4,7 @@ This document distinguishes implemented runtime properties from the work still r
 
 ## Current baseline
 
-The runtime already has a resident Gateway and supervised kernel services, durable goal/task lifecycles, READY/RUNNING/WAITING/PAUSED states, event and timer wakeups, lease recovery, bounded parallel goals, interrupts, resource contracts, capability contracts, side-effect operation records, temporal explicit memory, channel listener APIs, an attention allocator, plan versions, falsifiable assumptions, bounded plan-repair threads, and semantic resource claims. The operator terminal derives explanations from persisted state, exposes thread resource use and authority, and replays DAG, plan, evidence, and audit causality.
+The runtime already has a resident Gateway and supervised kernel services, durable goal/task lifecycles, READY/RUNNING/WAITING/PAUSED states, event and timer wakeups, lease recovery, bounded parallel goals, interrupts, resource contracts, capability contracts, side-effect operation records, temporal explicit memory, channel listener APIs, an attention allocator, plan versions, falsifiable assumptions, bounded plan-repair threads, and semantic resource claims. The operator terminal derives explanations from persisted state, exposes thread resource use and authority, and replays DAG, plan, evidence, and audit causality. The production-hardening baseline also includes mandatory bearer authentication for new setups, bounded auth/request rates, fail-closed SecretRef and plugin loading, private atomic files, SQLite integrity and migration records, validated Goal DAGs and transactional fan-out enforcement, symlink-resistant workspace operations, connection-time DNS pinning and no-redirect model/public fetches, external-content trust labels, source-bound replay protection and reserved kernel topics, atomic approval wakeups, atomic message/Goal creation, strict outbox idempotency, pinned CI actions, dependency updates, CodeQL, and a runnable security audit.
 
 This is a durable event-driven agent runtime. It is not yet a complete cognitive operating system.
 
@@ -16,7 +16,7 @@ The listener API is real, but the repository lacks production adapters for email
 
 ### 2. Strong execution isolation
 
-Capabilities are enforced logically, while `SandboxRegistry` only defines an adapter boundary. There is no built-in container, microVM, seccomp, filesystem namespace, browser-profile isolation, or per-tenant process boundary. Code and browser execution must not be considered strongly isolated until concrete sandbox backends and adversarial tests exist.
+Capabilities are enforced logically, while `SandboxRegistry` only defines a trusted adapter boundary. Browser and code tools are rejected unless the adapter declares process, container, or microVM isolation, but the repository does not ship or independently attest a container, microVM, seccomp, filesystem namespace, browser-profile isolation, or per-tenant process boundary. Code and browser execution must not be considered strongly isolated until concrete sandbox backends and adversarial tests exist.
 
 ### 3. Distributed residency and availability
 
@@ -28,7 +28,7 @@ The runtime now stores plan versions and falsifiable assumptions. A matching dur
 
 ### 5. Memory consolidation and belief evaluation
 
-Explicit memory now records kind, source, confidence, temporal validity, provenance, confirmation, supersession, and contradiction state. Retrieval excludes inactive and temporally invalid beliefs, while conversation history remains a separate retention domain. The remaining gap is automatic but reviewable consolidation across episodic, semantic, procedural, and working memory; salience decay; semantic contradiction discovery; source trust calibration; and retrieval-quality evaluation.
+Explicit memory now records kind, source, confidence, temporal validity, provenance, confirmation, supersession, and contradiction state. Retrieval excludes inactive and temporally invalid beliefs, while conversation history remains a separate retention domain. Versioned SHA-256-addressed bundles, Ed25519 publisher signatures, candidate staging, local/HTTPS snapshot and CAS providers, durable sync runs, and an isolated resident sync reactor provide secure portability. The remaining gap is automatic but reviewable consolidation across episodic, semantic, procedural, and working memory; salience decay; semantic contradiction discovery; semantic merge policies across devices; signed mutable CAS head records; deletion propagation; source trust calibration; and retrieval-quality evaluation.
 
 ### 6. Claim-level provenance
 
@@ -48,7 +48,7 @@ Token usage is provider-reported when available and otherwise estimated. Model p
 
 ### 10. Side-effect completeness
 
-The operation protocol supports prepare, execute, confirm, reconciliation, and compensation, but guarantees are only as strong as each tool adapter. Every production side-effect tool needs an explicit idempotency classification, external status query, uncertainty policy, compensation semantics, approval policy, and crash-injection tests.
+The operation protocol supports prepare, execute, confirm, reconciliation, and compensation. Operation keys are Store-bound to their ownership and canonical request, concurrent in-process retries coalesce, and transitions detect competing state writers. The remaining guarantees are only as strong as each tool adapter. Every production side-effect tool needs an explicit idempotency classification, external status query, uncertainty policy, compensation semantics, approval policy, and crash-injection tests.
 
 ### 11. Multi-agent organization
 
@@ -60,7 +60,7 @@ The system correctly persists external reasoning state, not hidden model activat
 
 ### 13. Reliability and operability
 
-The project needs schema migration discipline, online backup and restore, corruption recovery, chaos tests, clock-skew tests, long-duration soak tests, event-storm backpressure, OpenTelemetry export, SLOs, privacy retention controls, and upgrade/rollback procedures.
+The project now records schema migrations, checks SQLite integrity at startup, and enforces private database permissions. It still needs online backup and restore, migration rollback tests, corruption recovery, chaos tests, clock-skew tests, long-duration soak tests, event-storm backpressure, OpenTelemetry export, SLOs, privacy retention controls, and upgrade/rollback procedures.
 
 ### 14. Human control ergonomics
 

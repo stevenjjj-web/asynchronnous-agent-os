@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
 import { defaultConfig } from '../src/platform/config.js';
 import { PersonalAgentSystem } from '../src/system.js';
+import { canonicalEventEnvelope } from '../src/kernel/event-authenticator.js';
 
 function createConfig(home) {
   const config = defaultConfig({ projectRoot: home, home });
@@ -19,6 +20,9 @@ function createConfig(home) {
   config.kernel.interruptPollMs = 5;
   config.models.default = { provider: 'offline', model: 'offline' };
   config.agents[0].workspace = join(home, 'workspace');
+  config.security.tools.allow = ['*'];
+  config.security.capabilities.tools = ['*'];
+  config.security.capabilities.resourcePools = ['*'];
   return config;
 }
 
@@ -225,6 +229,7 @@ test('tool budgets and isolated resource pools are enforced independently', asyn
   }), /unavailable sandbox adapter/);
   system.sandboxes.register('test-isolated', {
     description: 'Test-only sandbox adapter.',
+    isolation: 'process',
     execute: ({ execute }) => execute(),
   });
   let active = 0;
@@ -358,6 +363,62 @@ test('side-effect operations reconcile uncertain results and support compensatio
   }
 });
 
+test('concurrent side-effect retries coalesce and operation keys stay bound to their original request', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'agent-os-operation-race-'));
+  const system = new PersonalAgentSystem(createConfig(home));
+  let calls = 0;
+  system.tools.register({
+    name: 'idempotent_probe',
+    description: 'Exercise operation replay serialization.',
+    risk: 'low',
+    resourcePool: 'default',
+    sideEffect: { mode: 'idempotent' },
+    parameters: {
+      type: 'object',
+      properties: { value: { type: 'string', maxLength: 100 } },
+      required: ['value'],
+      additionalProperties: false,
+    },
+    async execute({ value }) {
+      calls += 1;
+      await delay(20);
+      return { ok: true, value };
+    },
+  });
+  try {
+    const accepted = await system.sessions.submit({ text: 'Exercise side-effect replay serialization' });
+    const context = {
+      task: accepted.tasks[0],
+      session: accepted.session,
+      idempotencyKey: 'operation-race:1',
+    };
+    const [first, second] = await Promise.all([
+      system.tools.execute('idempotent_probe', { value: 'same' }, context),
+      system.tools.execute('idempotent_probe', { value: 'same' }, context),
+    ]);
+    assert.equal(calls, 1);
+    assert.equal(first.value, 'same');
+    assert.equal(second.value, 'same');
+    assert.throws(() => system.store.prepareOperation({
+      idempotencyKey: context.idempotencyKey,
+      goalId: context.task.goal_id,
+      taskId: context.task.id,
+      toolName: 'idempotent_probe',
+      mode: 'idempotent',
+      resourcePool: 'default',
+      request: { value: 'different' },
+    }), /reused with different content/);
+    const operation = system.store.getOperation(context.idempotencyKey);
+    assert.throws(
+      () => system.store.transitionOperation(operation.id, 'EXECUTING'),
+      /Invalid operation transition/,
+    );
+  } finally {
+    await system.stop();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('attention allocation scores deadlines, observations, conflicts, and long-blocked work', async () => {
   const home = mkdtempSync(join(tmpdir(), 'agent-os-attention-'));
   const config = createConfig(home);
@@ -411,7 +472,10 @@ test('external event authentication binds ownership and rejects replayed nonces'
   const home = mkdtempSync(join(tmpdir(), 'agent-os-event-auth-'));
   const config = createConfig(home);
   config.security.events.requireSignature = true;
-  config.security.events.sourceSecrets = { github: 'env:AGENT_OS_EVENT_TEST_KEY' };
+  config.security.events.sourceSecrets = {
+    github: 'env:AGENT_OS_EVENT_TEST_KEY',
+    gitlab: 'env:AGENT_OS_EVENT_TEST_KEY',
+  };
   const previous = process.env.AGENT_OS_EVENT_TEST_KEY;
   process.env.AGENT_OS_EVENT_TEST_KEY = 'event-test-key';
   const system = new PersonalAgentSystem(config);
@@ -427,15 +491,7 @@ test('external event authentication binds ownership and rejects replayed nonces'
       timestamp,
       nonce: 'github-delivery-42',
     };
-    const canonical = [
-      timestamp,
-      input.nonce,
-      input.topic,
-      input.correlationKey,
-      input.tenantId,
-      input.agentId,
-      JSON.stringify(input.payload),
-    ].join('.');
+    const canonical = canonicalEventEnvelope(input);
     const signature = createHmac('sha256', process.env.AGENT_OS_EVENT_TEST_KEY).update(canonical).digest('hex');
     const auth = system.eventAuthenticator.verify({ ...input, signature });
     assert.equal(auth.authenticated, true);
@@ -444,6 +500,7 @@ test('external event authentication binds ownership and rejects replayed nonces'
     assert.equal(first.duplicate, false);
     assert.equal(replay.duplicate, true);
     assert.throws(() => system.eventAuthenticator.verify({ ...input, nonce: 'different', signature }), /signature is invalid/);
+    assert.throws(() => system.eventAuthenticator.verify({ ...input, source: 'gitlab', signature }), /signature is invalid/);
   } finally {
     if (previous === undefined) delete process.env.AGENT_OS_EVENT_TEST_KEY;
     else process.env.AGENT_OS_EVENT_TEST_KEY = previous;

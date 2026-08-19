@@ -2,7 +2,7 @@ import { waitForAbort } from './async-signal.js';
 import { ServiceSupervisor } from './service-supervisor.js';
 
 export class KernelDaemon {
-  constructor({ store, scheduler, housekeeping, interrupts, cognition, planRepair, listeners, config }) {
+  constructor({ store, scheduler, housekeeping, interrupts, cognition, planRepair, memoryPortability, listeners, config }) {
     this.config = config;
     this.scheduler = scheduler;
     this.supervisor = new ServiceSupervisor({
@@ -47,6 +47,9 @@ export class KernelDaemon {
       })
       .register('plan-repair-reactor', (context) => planRepair.run(context), {
         role: 'assumption-invalidation-and-bounded-cognitive-repair',
+      })
+      .register('memory-sync-reactor', (context) => memoryPortability.run(context), {
+        role: 'signed-memory-provider-synchronization',
       });
     this.listeners = listeners;
     this.listenersRegistered = false;

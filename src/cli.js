@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, constants, existsSync, openSync, unlinkSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { createHmac, randomUUID } from 'node:crypto';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
@@ -13,8 +13,11 @@ import { createFormatter, printJson, relativeTime, table } from './cli/format.js
 import { interactiveChat, renderHealth, taskColumns } from './cli/interactive.js';
 import { waitForGoal } from './cli/wait.js';
 import { runModelWizard, runSetupWizard } from './cli/setup-wizard.js';
+import { atomicWritePrivateFile, ensurePrivateDirectory, readPrivateTextFile } from './platform/fs-safety.js';
+import { fixSecurityPermissions, runSecurityAudit } from './security/audit.js';
+import { canonicalEventEnvelope } from './kernel/event-authenticator.js';
 
-const VERSION = '0.10.0';
+const VERSION = '0.12.0';
 const { flags, positionals } = parseArgs(process.argv.slice(2));
 const command = positionals[0] ?? (stdin.isTTY && flags.json !== true ? 'chat' : 'help');
 const subcommand = positionals[1];
@@ -62,6 +65,7 @@ async function dispatch() {
   }
   if (command === 'init') return init();
   if (command === 'doctor') return doctor();
+  if (command === 'security') return security();
   if (command === 'status' || command === 'health' || (command === 'gateway' && subcommand === 'status')) return status();
   if (command === 'chat' || command === 'terminal') return openInteractiveTerminal();
   if (command === 'run' || command === 'agent') return runAgent();
@@ -93,8 +97,9 @@ function help() {
   stdout.write(`Usage: agent-os <command> [options]\n\n`);
   stdout.write(`Core\n  gateway run              Run the daemon in the foreground\n  gateway start|stop|restart|status\n                           Control a detached daemon process\n  kernel status|processes  Inspect resident kernel services\n  status                   Show pulse, threads, memory, and sensing\n  run <prompt>             Submit work and follow it to a wait or terminal state\n  chat                     Open an interactive terminal session\n\n`);
   stdout.write(`Runtime\n  manager | ps             Explain active thought threads and resource use\n  manager <task-id>        Inspect checkpoint, wait, budget, and capabilities\n  trace <goal-id>          Replay the DAG, causal chain, evidence, and plan changes\n  goals list|show|contract|plan\n                           Inspect goals, authority, assumptions, and plan versions\n  tasks list|show|watch    Inspect thought threads\n  tasks pause|resume|cancel|priority <id>\n  resources                Inspect quotas and isolated pools\n  capabilities show|revoke Inspect frozen authority\n  operations list|show|reconcile|compensate\n  interrupts list|raise    Inspect or raise durable preemption signals\n  cognition status|enable|disable|reflect\n  attention                Inspect attention-value assessments\n  logs [--follow]          Stream the append-only execution ledger\n  events list|emit         Inspect or publish durable events\n\n`);
-  stdout.write(`Agent services\n  sessions list|show|purge Inspect or remove conversation history\n  memory list|search|add|confirm|retract|forget\n                           Manage sourced and temporal long-term memory\n  credentials list|add|revoke\n  approvals list|approve|deny\n  schedules list|add|enable|disable\n  monitors list|show|add|run|enable|disable\n  tools                    List tools, sensors, and listeners\n\n`);
+  stdout.write(`Agent services\n  sessions list|show|purge Inspect or remove conversation history\n  memory list|search|add|confirm|retract|forget\n                           Manage sourced and temporal long-term memory\n  memory export|import|providers|pull|push|syncs\n                           Move signed memory bundles across providers\n  credentials list|add|revoke\n  approvals list|approve|deny\n  schedules list|add|enable|disable\n  monitors list|show|add|run|enable|disable\n  tools                    List tools, sensors, and listeners\n\n`);
   stdout.write(`Setup\n  setup | onboard | configure\n                           Guided full-system setup and policy wizard\n  model                    Add a named model provider configuration\n  init                     Create config and workspace baseline only\n  doctor                   Validate local config and gateway readiness\n\n`);
+  stdout.write(`Security\n  security audit [--fix]   Audit authentication, authority, plugins, sandboxes, and file permissions\n\n`);
   stdout.write(`Global flags: --json --no-color --no-animation --simple-ui --gateway <url> --token <token> --help --version\n`);
 }
 
@@ -164,12 +169,14 @@ async function configureAdditionalModel(initialPreset) {
 
 async function doctor() {
   const errors = validateConfig(config);
+  const securityAudit = runSecurityAudit(config);
   let gateway = null;
   try { gateway = await client.get('/api/health'); } catch (error) { gateway = { ok: false, error: error.message }; }
   const result = {
-    ok: errors.length === 0,
+    ok: errors.length === 0 && securityAudit.ok,
     config: { path: config.configPath, home: config.home, database: config.database, errors },
     gateway,
+    security: securityAudit,
   };
   if (json) printJson(result);
   else {
@@ -177,8 +184,30 @@ async function doctor() {
     stdout.write(`  path      ${config.configPath}\n  home      ${config.home}\n  database  ${config.database}\n`);
     stdout.write(`${format.bold('Gateway')} ${gateway.ok ? format.green('reachable') : format.yellow('not reachable')}\n`);
     if (gateway.error) stdout.write(`  ${gateway.error}\n`);
+    stdout.write(`${format.bold('Security')} ${securityAudit.ok ? format.green('hardened') : format.yellow('review required')} · ${securityAudit.summary.critical} critical · ${securityAudit.summary.high} high\n`);
   }
   if (!result.ok || flags['require-gateway'] && !gateway.ok) process.exitCode = 1;
+}
+
+function security() {
+  const action = subcommand ?? 'audit';
+  if (action !== 'audit') throw new Error(`Unknown security command: ${action}`);
+  const fixed = flags.fix === true ? fixSecurityPermissions(config) : null;
+  const result = runSecurityAudit(config);
+  if (json) printJson({ ...result, fixed });
+  else {
+    stdout.write(`${format.bold('Agent OS security audit')} · ${result.trustModel}\n`);
+    stdout.write(`${result.summary.critical} critical · ${result.summary.high} high · ${result.summary.warning} warning · ${result.summary.info} info\n\n`);
+    for (const item of result.findings) {
+      const color = item.severity === 'critical' ? format.red
+        : item.severity === 'high' ? format.yellow
+          : item.severity === 'warning' ? format.cyan : format.dim;
+      stdout.write(`${color(item.severity.toUpperCase().padEnd(8))} ${item.id} — ${item.title}\n  ${item.detail}\n`);
+      if (item.remediation) stdout.write(`  ${format.dim(`Fix: ${item.remediation}`)}\n`);
+    }
+    if (fixed) stdout.write(`\n${format.green('Permissions repaired')} · ${fixed.changed.length} paths\n`);
+  }
+  if (!result.ok) process.exitCode = 1;
 }
 
 async function status() {
@@ -197,8 +226,9 @@ async function startGatewayDaemon() {
   } catch {
     // A failed health check is expected when starting a stopped daemon.
   }
-  mkdirSync(join(config.home, 'logs'), { recursive: true });
-  const logFd = openSync(gatewayLogPath, 'a');
+  ensurePrivateDirectory(join(config.home, 'logs'));
+  const logFd = openSync(gatewayLogPath, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | (constants.O_NOFOLLOW ?? 0), 0o600);
+  chmodSync(gatewayLogPath, 0o600);
   const child = spawn(process.execPath, [serverPath], {
     cwd: process.cwd(),
     detached: true,
@@ -207,7 +237,7 @@ async function startGatewayDaemon() {
   });
   closeSync(logFd);
   if (!child.pid) throw new Error('Failed to create the gateway daemon process');
-  writeFileSync(pidPath, `${JSON.stringify({ pid: child.pid, startedAt: Date.now(), cwd: process.cwd() })}\n`, 'utf8');
+  atomicWritePrivateFile(pidPath, `${JSON.stringify({ pid: child.pid, startedAt: Date.now(), cwd: process.cwd() })}\n`);
   child.unref();
   let health;
   try {
@@ -232,7 +262,7 @@ async function stopGatewayDaemon({ allowStopped = false } = {}) {
   const pid = Number(health.kernel?.hostPid);
   if (!Number.isInteger(pid) || pid <= 1) throw new Error('Gateway reported an invalid host pid');
   if (existsSync(pidPath)) {
-    const record = JSON.parse(readFileSync(pidPath, 'utf8'));
+    const record = JSON.parse(readPrivateTextFile(pidPath, { maxBytes: 10_000 }));
     if (Number(record.pid) !== pid) throw new Error('Gateway pid does not match the local pid file');
   }
   process.kill(pid, 'SIGTERM');
@@ -522,6 +552,82 @@ async function sessions() {
 
 async function memory() {
   const action = subcommand ?? 'list';
+  if (action === 'providers') {
+    const result = await client.get('/api/memory-portability/providers');
+    if (json) return printJson(result);
+    return stdout.write(`${table(result.providers, [
+      { label: 'PROVIDER', value: (item) => item.id, max: 24 },
+      { label: 'TYPE', value: (item) => item.type, max: 16 },
+      { label: 'PULL', value: (item) => item.canPull ? item.pullIntervalMs ?? 'manual' : '-', max: 12 },
+      { label: 'PUSH', value: (item) => item.canPush ? item.pushIntervalMs ?? 'manual' : '-', max: 12 },
+      { label: 'REMOTE', value: (item) => item.remote ? 'yes' : 'no', max: 6 },
+      { label: 'SIGNED', value: (item) => item.signatureRequired ? 'required' : '-', max: 8 },
+      { label: 'CRYPT', value: (item) => item.encryptionRequired ? 'required' : '-', max: 8 },
+      { label: 'AUTO ACTIVE', value: (item) => item.autoActivate ? 'yes' : 'no', max: 11 },
+    ])}\n`);
+  }
+  if (action === 'syncs') {
+    const query = new URLSearchParams({ limit: String(numberFlag(flags, 'limit', 100)) });
+    if (flags.provider) query.set('providerId', flags.provider);
+    const result = await client.get(`/api/memory-portability/runs?${query}`);
+    if (json) return printJson(result);
+    return stdout.write(`${table(result.runs, [
+      { label: 'STATUS', value: (item) => item.status, max: 10 },
+      { label: 'DIRECTION', value: (item) => item.direction, max: 9 },
+      { label: 'PROVIDER', value: (item) => item.provider_id, max: 20 },
+      { label: 'IMPORTED', value: (item) => item.imported_count, max: 8 },
+      { label: 'DUP', value: (item) => item.duplicate_count, max: 5 },
+      { label: 'SIGNATURE', value: (item) => item.signature_status ?? '-', max: 14 },
+      { label: 'WHEN', value: (item) => relativeTime(item.started_at), max: 12 },
+      { label: 'ERROR', value: (item) => item.error ?? '-', max: 40 },
+    ])}\n`);
+  }
+  if (action === 'export') {
+    const explicitPath = positionals[2];
+    const directory = explicitPath ? null : ensurePrivateDirectory(join(config.home, 'exports'));
+    const path = resolve(explicitPath ?? join(directory, `memory-${new Date().toISOString().replaceAll(':', '-')}.json`));
+    const result = await client.post('/api/memory-portability/export', {
+      agentId: flags.agent ?? 'main',
+      includeInactive: flags['include-inactive'] === true,
+      unsigned: flags.unsigned === true,
+      limit: numberFlag(flags, 'limit', config.memory.portability.maxEntries),
+    });
+    atomicWritePrivateFile(path, `${JSON.stringify(result.bundle, null, 2)}\n`, { privateDirectory: !explicitPath });
+    return json
+      ? printJson({ path, digest: result.digest, payloadDigest: result.payloadDigest, contentDigest: result.contentDigest, encrypted: result.encrypted, count: result.count })
+      : stdout.write(`Exported ${result.count} memories to ${path}\nDigest: ${result.digest}\nEncrypted: ${result.encrypted ? 'yes' : 'no'}\n`);
+  }
+  if (action === 'import') {
+    const configuredPath = positionals[2];
+    if (!configuredPath) throw new Error('Memory import path is required');
+    const path = resolve(configuredPath);
+    const serialized = readPrivateTextFile(path, { maxBytes: config.memory.portability.maxBundleBytes });
+    let bundle;
+    try { bundle = JSON.parse(serialized); } catch { throw new Error('Memory import file is not valid JSON'); }
+    const result = await client.post('/api/memory-portability/import', {
+      bundle,
+      agentId: flags.agent ?? 'main',
+      activate: flags.activate === true,
+    });
+    return json
+      ? printJson(result)
+      : stdout.write(`Imported ${result.imported} memories (${result.duplicates} duplicates) as ${result.status}.\nDigest: ${result.digest}\n`);
+  }
+  if (action === 'pull' || action === 'push') {
+    const providerId = positionals[2];
+    if (!providerId) throw new Error(`Memory ${action} requires a provider id`);
+    const result = await client.post(`/api/memory-portability/providers/${encodeURIComponent(providerId)}/${action}`, {
+      agentId: flags.agent ?? 'main',
+      digest: flags.digest,
+      activate: flags.activate === true,
+      includeInactive: flags['include-inactive'] === true,
+    });
+    if (json) return printJson(result);
+    if (action === 'pull') {
+      return stdout.write(`Pulled ${result.digest}: ${result.imported} imported, ${result.duplicates} duplicates, status ${result.status}.\n`);
+    }
+    return stdout.write(`Pushed ${result.count} memories to ${providerId}.\nDigest: ${result.digest}\n`);
+  }
   if (action === 'forget' || action === 'delete') {
     const id = positionals[2];
     if (!id) throw new Error('Memory id is required');
@@ -706,16 +812,9 @@ async function events() {
     if (!signature && flags['secret-env']) {
       const secret = process.env[flags['secret-env']];
       if (!secret) throw new Error(`Event signing secret is unavailable: ${flags['secret-env']}`);
-      const stable = (value) => {
-        if (Array.isArray(value)) return value.map(stable);
-        if (value && typeof value === 'object') {
-          return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]));
-        }
-        return value;
-      };
-      const canonical = [
-        timestamp, nonce, topic, correlationKey, tenantId, agentId, JSON.stringify(stable(payload)),
-      ].join('.');
+      const canonical = canonicalEventEnvelope({
+        source, timestamp, nonce, topic, correlationKey, tenantId, agentId, payload,
+      });
       signature = createHmac('sha256', secret).update(canonical).digest('hex');
     }
     const result = await client.post('/api/events', {

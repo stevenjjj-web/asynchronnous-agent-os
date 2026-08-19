@@ -147,6 +147,9 @@ test('high-risk tools create a durable approval gate before execution', async ()
   const home = mkdtempSync(join(tmpdir(), 'agent-os-approval-'));
   const config = createConfig(home);
   config.models.default = { provider: 'approval-script', model: 'approval-script' };
+  config.security.tools.allow.push('memory_forget');
+  config.security.capabilities.tools.push('memory_forget');
+  config.security.capabilities.resourcePools.push('isolated-side-effects');
   const system = new PersonalAgentSystem(config);
   const memory = system.memory.remember({ agentId: 'main', content: 'Test memory to delete', kind: 'note', source: 'test' });
   system.providers.register('approval-script', () => ({
@@ -168,11 +171,17 @@ test('high-risk tools create a durable approval gate before execution', async ()
     assert.ok(waiting);
     assert.ok(system.store.getMemory(memory.id));
 
-    const resolved = system.store.resolveApproval(approval.id, 'approve');
-    system.publishEvent({
-      topic: 'approval.resolved', correlationKey: approval.id,
-      payload: { decision: 'approve', status: resolved.status }, idempotencyKey: `resolve:${approval.id}`,
+    const outcome = system.store.resolveApprovalAndPublishEvent(approval.id, 'approve', {
+      resolvedBy: 'gateway-operator',
+    }, {
+      source: 'approval-api',
+      tenantId: 'default',
+      agentId: 'main',
+      authenticated: true,
+      authSubject: 'gateway-operator',
     });
+    system.eventBus.announce(outcome.delivery);
+    system.scheduler.requestDrain();
     await waitFor(() => system.store.getGoal(accepted.goal.id).status === 'SUCCEEDED');
     assert.equal(system.store.getMemory(memory.id), null);
   } finally {
@@ -366,13 +375,13 @@ test('a resident kernel process and supervised services stay alive while idle', 
   try {
     const first = await waitFor(() => {
       const processes = system.store.listKernelProcesses({ status: 'RUNNING' });
-      return processes.length === 7 ? processes : null;
+      return processes.length === 8 ? processes : null;
     });
     const root = first.find((processRecord) => processRecord.kind === 'kernel');
     assert.equal(root.host_pid, process.pid);
     assert.deepEqual(
       first.filter((processRecord) => processRecord.kind === 'resident-service').map((item) => item.name).sort(),
-      ['cognition-loop', 'interrupt-reactor', 'io-reactor', 'listener:workspace-inbox', 'plan-repair-reactor', 'scheduler'],
+      ['cognition-loop', 'interrupt-reactor', 'io-reactor', 'listener:workspace-inbox', 'memory-sync-reactor', 'plan-repair-reactor', 'scheduler'],
     );
     const heartbeat = root.heartbeat_at;
     await waitFor(() => system.store.getKernelProcess(root.id).heartbeat_at > heartbeat);

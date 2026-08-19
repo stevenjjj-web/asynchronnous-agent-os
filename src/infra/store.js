@@ -1,8 +1,9 @@
-import { mkdirSync } from 'node:fs';
+import { chmodSync, existsSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { GoalStatus, TaskStatus, TERMINAL_TASK_STATUSES, WaitKind } from '../domain/states.js';
+import { ensurePrivateDirectory } from '../platform/fs-safety.js';
 
 const now = () => Date.now();
 const encode = (value) => JSON.stringify(value ?? null);
@@ -14,6 +15,37 @@ const decode = (value, fallback = null) => {
     return fallback;
   }
 };
+
+function boundedText(value, name, maximum, { optional = false } = {}) {
+  if (value == null && optional) return null;
+  if (typeof value !== 'string' || !value || value.length > maximum || value.includes('\0')) {
+    throw new Error(`${name} must contain 1 to ${maximum} characters`);
+  }
+  return value;
+}
+
+function boundedJson(value, name, maximum = 2_000_000) {
+  let serialized;
+  try { serialized = encode(value); } catch { throw new Error(`${name} must be JSON-serializable`); }
+  if (Buffer.byteLength(serialized) > maximum) throw new Error(`${name} exceeds ${maximum} bytes`);
+  return serialized;
+}
+
+function stable(value, depth = 0) {
+  if (depth > 64) throw new Error('JSON value exceeds the maximum nesting depth');
+  if (Array.isArray(value)) return value.map((item) => stable(item, depth + 1));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => {
+      if (['__proto__', 'prototype', 'constructor'].includes(key)) throw new Error(`JSON value contains an unsafe key: ${key}`);
+      return [key, stable(value[key], depth + 1)];
+    }));
+  }
+  return value;
+}
+
+function sameJson(left, right) {
+  return JSON.stringify(stable(left)) === JSON.stringify(stable(right));
+}
 
 function hydrateGoal(row) {
   if (!row) return null;
@@ -33,7 +65,17 @@ function hydrateTask(row) {
 
 function hydrateEvent(row) {
   if (!row) return null;
-  return { ...row, payload: decode(row.payload_json, {}) };
+  return {
+    ...row,
+    payload: decode(row.payload_json, {}),
+    correlationKey: row.correlation_key,
+    idempotencyKey: row.idempotency_key,
+    tenantId: row.tenant_id,
+    agentId: row.agent_id,
+    authenticated: Boolean(row.authenticated),
+    authSubject: row.auth_subject,
+    createdAt: row.created_at,
+  };
 }
 
 function hydrateAudit(row) {
@@ -54,6 +96,11 @@ function hydrateMessage(row) {
 function hydrateMemory(row) {
   if (!row) return null;
   return { ...row, tags: decode(row.tags_json, []), provenance: decode(row.provenance_json, {}) };
+}
+
+function hydrateMemorySyncRun(row) {
+  if (!row) return null;
+  return { ...row, metadata: decode(row.metadata_json, {}) };
 }
 
 function hydratePlanVersion(row) {
@@ -144,16 +191,39 @@ function hydrateCredentialRef(row) {
 
 export class Store {
   constructor(filename = ':memory:') {
-    if (filename !== ':memory:') mkdirSync(dirname(filename), { recursive: true });
+    this.filename = filename;
+    if (filename !== ':memory:') ensurePrivateDirectory(dirname(filename));
     this.db = new DatabaseSync(filename);
+    this.secureDatabaseFiles();
     this.db.exec('PRAGMA foreign_keys = ON');
     this.db.exec('PRAGMA journal_mode = WAL');
+    this.db.exec('PRAGMA synchronous = FULL');
     this.db.exec('PRAGMA busy_timeout = 5000');
+    this.db.exec('PRAGMA trusted_schema = OFF');
+    this.db.exec('PRAGMA secure_delete = FAST');
     this.migrate();
+    const integrity = this.db.prepare('PRAGMA quick_check(1)').get();
+    if (integrity?.quick_check !== 'ok') throw new Error(`Database integrity check failed: ${integrity?.quick_check ?? 'unknown error'}`);
+    this.secureDatabaseFiles();
+  }
+
+  secureDatabaseFiles() {
+    if (this.filename === ':memory:' || process.platform === 'win32') return;
+    for (const path of [this.filename, `${this.filename}-wal`, `${this.filename}-shm`]) {
+      if (existsSync(path)) chmodSync(path, 0o600);
+    }
   }
 
   migrate() {
+    const currentVersion = Number(this.db.prepare('PRAGMA user_version').get().user_version ?? 0);
+    if (currentVersion > 8) throw new Error(`Database schema version ${currentVersion} is newer than this runtime supports`);
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
+        description TEXT NOT NULL,
+        applied_at INTEGER NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS goals (
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
@@ -558,6 +628,25 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_operations_reconcile
         ON operations(state, next_reconcile_at);
 
+      CREATE TABLE IF NOT EXISTS memory_sync_runs (
+        id TEXT PRIMARY KEY,
+        provider_id TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        status TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        tenant_id TEXT NOT NULL,
+        bundle_digest TEXT,
+        signature_status TEXT,
+        imported_count INTEGER NOT NULL DEFAULT 0,
+        duplicate_count INTEGER NOT NULL DEFAULT 0,
+        error TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_memory_sync_runs_scope
+        ON memory_sync_runs(tenant_id, agent_id, started_at DESC);
+
       CREATE TABLE IF NOT EXISTS attention_assessments (
         id TEXT PRIMARY KEY,
         agent_id TEXT NOT NULL,
@@ -639,7 +728,15 @@ export class Store {
     } catch {
       this.memoryFts = false;
     }
-    this.db.exec('PRAGMA user_version = 6');
+    this.db.prepare(`
+      INSERT OR IGNORE INTO schema_migrations(version, description, applied_at)
+      VALUES (7, 'Production security and atomic session goal submission baseline', ?)
+    `).run(now());
+    this.db.prepare(`
+      INSERT OR IGNORE INTO schema_migrations(version, description, applied_at)
+      VALUES (8, 'Content-addressed signed memory portability and sync records', ?)
+    `).run(now());
+    this.db.exec('PRAGMA user_version = 8');
   }
 
   ensureColumn(table, column, definition) {
@@ -661,7 +758,43 @@ export class Store {
     }
   }
 
-  createGoalWithTasks(goalInput, taskInputs) {
+  createGoalWithTasks(goalInput, taskInputs, { withinTransaction = false } = {}) {
+    boundedText(goalInput.title, 'Goal title', 500);
+    boundedText(goalInput.objective, 'Goal objective', 200_000);
+    if (!Array.isArray(taskInputs) || taskInputs.length < 1 || taskInputs.length > 256) {
+      throw new Error('A goal must contain 1 to 256 tasks');
+    }
+    const preparedTasks = taskInputs.map((input) => ({ ...input, id: input.id ?? randomUUID() }));
+    const taskIds = new Set();
+    for (const task of preparedTasks) {
+      boundedText(task.id, 'Task id', 256);
+      if (taskIds.has(task.id)) throw new Error(`Duplicate task id in Goal DAG: ${task.id}`);
+      taskIds.add(task.id);
+    }
+    const dependencyGraph = new Map();
+    for (const task of preparedTasks) {
+      const dependencies = task.dependsOn ?? [];
+      if (!Array.isArray(dependencies) || dependencies.length > 256 || dependencies.some((id) => typeof id !== 'string' || !id || id.length > 256)) {
+        throw new Error('Task dependencies must be an array of at most 256 task ids');
+      }
+      for (const dependency of dependencies) {
+        if (!taskIds.has(dependency)) throw new Error(`Task dependency is outside the Goal DAG: ${dependency}`);
+        if (dependency === task.id) throw new Error(`Task cannot depend on itself: ${task.id}`);
+      }
+      dependencyGraph.set(task.id, dependencies);
+    }
+    const visited = new Set();
+    const visiting = new Set();
+    const visit = (taskId) => {
+      if (visiting.has(taskId)) throw new Error(`Goal task graph contains a dependency cycle at: ${taskId}`);
+      if (visited.has(taskId)) return;
+      visiting.add(taskId);
+      for (const dependency of dependencyGraph.get(taskId) ?? []) visit(dependency);
+      visiting.delete(taskId);
+      visited.add(taskId);
+    };
+    for (const taskId of taskIds) visit(taskId);
+    boundedJson(goalInput.metadata ?? {}, 'Goal metadata');
     const semanticClaims = goalInput.metadata?.resourceClaims ?? [];
     if (!Array.isArray(semanticClaims)) throw new Error('Goal resourceClaims must be an array');
     if (semanticClaims.length > 64) throw new Error('A goal may declare at most 64 semantic resource claims');
@@ -674,35 +807,63 @@ export class Store {
         throw new Error(`Unsupported semantic resource claim mode: ${claim.mode}`);
       }
     }
-    return this.transaction(() => {
+    const create = () => {
       const timestamp = now();
       const goalId = goalInput.id ?? randomUUID();
+      boundedText(goalId, 'Goal id', 256);
       const contract = goalInput.contract ?? {
         tenantId: goalInput.tenantId ?? 'default',
         agentId: goalInput.agentId ?? 'main',
         parentGoalId: goalInput.metadata?.parentGoalId ?? null,
         deadlineAt: goalInput.deadlineAt ?? null,
         budget: {
-          maxInputTokens: 1_000_000,
-          maxOutputTokens: 1_000_000,
-          maxCostUsd: 100,
-          maxToolCalls: 10_000,
-          maxWallTimeMs: 86_400_000,
-          maxContextChars: 200_000,
-          maxFanOut: 100,
-          maxDepth: 10,
+          maxInputTokens: 120_000,
+          maxOutputTokens: 40_000,
+          maxCostUsd: 5,
+          maxToolCalls: 100,
+          maxWallTimeMs: 3_600_000,
+          maxContextChars: 100_000,
+          maxFanOut: 8,
+          maxDepth: 3,
         },
         capabilities: {
-          tools: ['*'],
-          resourcePools: ['*'],
-          filesystem: { roots: ['.'], operations: ['list', 'read', 'write', 'delete'] },
-          network: { domains: ['*'], methods: ['GET'] },
+          tools: [],
+          resourcePools: [],
+          filesystem: { roots: [], operations: [] },
+          network: { domains: [], methods: [] },
           accounts: {},
           dataScopes: ['agent:self'],
           credentialRefs: [],
           constraints: {},
         },
       };
+      const agentId = contract.agentId ?? goalInput.agentId ?? 'main';
+      const tenantId = contract.tenantId ?? goalInput.tenantId ?? 'default';
+      boundedText(agentId, 'Goal agent id', 128);
+      boundedText(tenantId, 'Goal tenant id', 128);
+      if (goalInput.agentId && goalInput.agentId !== agentId) throw new Error('Goal and contract agent ownership do not match');
+      if (goalInput.tenantId && goalInput.tenantId !== tenantId) throw new Error('Goal and contract tenant ownership do not match');
+      boundedJson(contract.budget ?? {}, 'Goal budget', 100_000);
+      boundedJson(contract.capabilities ?? {}, 'Goal capabilities', 500_000);
+      if (contract.parentGoalId) {
+        const parent = this.getGoalContract(contract.parentGoalId);
+        if (!parent) throw new Error(`Parent goal contract is unavailable: ${contract.parentGoalId}`);
+        if (parent.agent_id !== agentId || parent.tenant_id !== tenantId) {
+          throw new Error('Child goals cannot cross agent or tenant ownership boundaries');
+        }
+        const directChildren = Number(this.db.prepare(
+          'SELECT COUNT(*) AS count FROM goal_contracts WHERE parent_goal_id = ?',
+        ).get(contract.parentGoalId).count);
+        const maximumFanOut = Number(parent.budget.maxFanOut ?? 0);
+        if (!Number.isInteger(maximumFanOut) || directChildren >= maximumFanOut) {
+          throw new Error(`Parent goal fan-out limit is exhausted: ${maximumFanOut}`);
+        }
+        const depth = Number(goalInput.metadata?.spawnDepth ?? 0);
+        const maximumDepth = Number(parent.budget.maxDepth ?? 0);
+        if (!Number.isInteger(depth) || depth < 1 || depth > maximumDepth) {
+          throw new Error(`Child goal depth exceeds the parent limit: ${maximumDepth}`);
+        }
+      }
       this.db.prepare(`
         INSERT INTO goals(
           id, title, objective, status, metadata_json, agent_id, session_id,
@@ -714,19 +875,27 @@ export class Store {
         goalInput.objective,
         GoalStatus.ACTIVE,
         encode(goalInput.metadata ?? {}),
-        goalInput.agentId ?? 'main',
+        agentId,
         goalInput.sessionId ?? null,
-        contract.tenantId ?? goalInput.tenantId ?? 'default',
+        tenantId,
         contract.deadlineAt ?? goalInput.deadlineAt ?? null,
         timestamp,
         timestamp,
       );
 
-      const tasks = taskInputs.map((input) => {
-        const taskId = input.id ?? randomUUID();
+      const tasks = preparedTasks.map((input) => {
+        const taskId = input.id;
+        boundedText(input.title, 'Task title', 500);
+        boundedText(input.kind ?? 'workflow', 'Task kind', 128);
         const dependencies = input.dependsOn ?? [];
+        const priority = Number(input.priority ?? 50);
+        if (!Number.isFinite(priority) || priority < 0 || priority > 100) throw new Error('Task priority must be between 0 and 100');
+        const maxAttempts = Number(input.maxAttempts ?? 3);
+        if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 100) throw new Error('Task maxAttempts must be between 1 and 100');
         const status = dependencies.length ? TaskStatus.BLOCKED : TaskStatus.READY;
         const snapshot = input.snapshot ?? { pc: 0, variables: {}, checkpoints: [] };
+        const workflowJson = boundedJson(input.workflow ?? [], 'Task workflow');
+        const snapshotJson = boundedJson(snapshot, 'Task snapshot');
         this.db.prepare(`
           INSERT INTO tasks(
             id, goal_id, title, kind, status, priority, workflow_json, snapshot_json,
@@ -738,17 +907,17 @@ export class Store {
           input.title,
           input.kind ?? 'workflow',
           status,
-          input.priority ?? 50,
-          encode(input.workflow ?? []),
-          encode(snapshot),
+          priority,
+          workflowJson,
+          snapshotJson,
           encode(dependencies),
           input.sessionId ?? goalInput.sessionId ?? null,
-          input.maxAttempts ?? 3,
+          maxAttempts,
           timestamp,
           timestamp,
           timestamp,
         );
-        this.appendAudit(goalId, taskId, 'TASK_CREATED', `${input.title} was created`, { status, priority: input.priority ?? 50 });
+        this.appendAudit(goalId, taskId, 'TASK_CREATED', `${input.title} was created`, { status, priority });
         return this.getTask(taskId);
       });
 
@@ -760,8 +929,8 @@ export class Store {
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?)
       `).run(
         goalId,
-        contract.agentId ?? goalInput.agentId ?? 'main',
-        contract.tenantId ?? goalInput.tenantId ?? 'default',
+        agentId,
+        tenantId,
         contract.parentGoalId ?? null,
         contract.deadlineAt ?? null,
         encode(contract.budget ?? {}),
@@ -774,7 +943,7 @@ export class Store {
 
       this.addPlanVersion(goalId, {
         objective: goalInput.objective,
-        tasks: taskInputs.map((task) => ({
+        tasks: preparedTasks.map((task) => ({
           id: task.id,
           title: task.title,
           kind: task.kind ?? 'workflow',
@@ -793,7 +962,8 @@ export class Store {
         deadlineAt: contract.deadlineAt ?? null,
       });
       return { goal: this.getGoal(goalId), tasks };
-    });
+    };
+    return withinTransaction ? create() : this.transaction(create);
   }
 
   getGoal(id) {
@@ -1190,6 +1360,15 @@ export class Store {
   createCredentialRef(input) {
     const timestamp = now();
     const id = input.id ?? randomUUID();
+    boundedText(id, 'Credential reference id', 256);
+    boundedText(input.tenantId ?? 'default', 'Credential tenant id', 128);
+    boundedText(input.agentId ?? 'main', 'Credential agent id', 128);
+    boundedText(input.provider ?? 'environment', 'Credential provider', 64);
+    boundedText(input.locator, 'Credential locator', 256);
+    if (input.expiresAt != null && (!Number.isFinite(Number(input.expiresAt)) || Number(input.expiresAt) <= timestamp)) {
+      throw new Error('Credential expiry must be a future timestamp');
+    }
+    const metadataJson = boundedJson(input.metadata ?? {}, 'Credential metadata', 100_000);
     this.db.prepare(`
       INSERT INTO credential_refs(
         id, tenant_id, agent_id, provider, locator, status, expires_at,
@@ -1202,7 +1381,7 @@ export class Store {
       input.provider ?? 'environment',
       input.locator,
       input.expiresAt ?? null,
-      encode(input.metadata ?? {}),
+      metadataJson,
       timestamp,
       timestamp,
     );
@@ -1461,29 +1640,67 @@ export class Store {
     return this.getTask(id);
   }
 
-  publishEvent(input) {
-    return this.transaction(() => {
-      const existing = input.idempotencyKey
-        ? this.db.prepare('SELECT * FROM events WHERE idempotency_key = ?').get(input.idempotencyKey)
-        : input.nonce
-          ? this.db.prepare('SELECT * FROM events WHERE source = ? AND nonce = ?').get(input.source ?? 'external', input.nonce)
+  publishEvent(input, { withinTransaction = false } = {}) {
+    const topic = boundedText(input.topic, 'Event topic', 256);
+    const correlationKey = boundedText(input.correlationKey, 'Event correlation key', 256);
+    const source = boundedText(input.source ?? 'external', 'Event source', 256);
+    const idempotencyKey = input.idempotencyKey == null
+      ? null
+      : boundedText(input.idempotencyKey, 'Event idempotency key', 512);
+    const nonce = input.nonce == null ? null : boundedText(input.nonce, 'Event nonce', 256);
+    const payload = input.payload ?? {};
+    const payloadJson = boundedJson(stable(payload), 'Event payload', 1_000_000);
+    if (topic === 'approval.resolved') {
+      const approval = this.getApproval(correlationKey);
+      const expectedStatus = payload?.decision === 'approve' ? 'APPROVED'
+        : payload?.decision === 'deny' ? 'DENIED' : null;
+      if (
+        source !== 'approval-api'
+        || input.authenticated !== true
+        || input.authSubject !== 'gateway-operator'
+        || !approval
+        || !expectedStatus
+        || approval.status !== expectedStatus
+        || payload.status !== approval.status
+      ) throw new Error('Approval resolution events must match an operator-authorized durable approval decision');
+    }
+    const publish = () => {
+      const existing = idempotencyKey
+        ? this.db.prepare('SELECT * FROM events WHERE idempotency_key = ?').get(idempotencyKey)
+        : nonce
+          ? this.db.prepare('SELECT * FROM events WHERE source = ? AND nonce = ?').get(source, nonce)
           : null;
-      if (existing) return { event: hydrateEvent(existing), awakened: [], duplicate: true };
+      if (existing) {
+        const hydrated = hydrateEvent(existing);
+        const equivalent = hydrated.topic === topic
+          && hydrated.correlation_key === correlationKey
+          && hydrated.source === source
+          && hydrated.idempotency_key === idempotencyKey
+          && hydrated.nonce === nonce
+          && hydrated.tenant_id === (input.tenantId ?? null)
+          && hydrated.agent_id === (input.agentId ?? null)
+          && Boolean(hydrated.authenticated) === (input.authenticated === true)
+          && hydrated.auth_subject === (input.authSubject ?? null)
+          && sameJson(hydrated.payload, payload);
+        if (!equivalent) throw new Error('Event replay key was reused with different ownership or content');
+        return { event: hydrated, awakened: [], duplicate: true };
+      }
 
       const event = {
         id: input.id ?? randomUUID(),
-        topic: input.topic,
-        correlationKey: input.correlationKey,
-        payload: input.payload ?? {},
-        source: input.source ?? 'external',
-        idempotencyKey: input.idempotencyKey ?? null,
+        topic,
+        correlationKey,
+        payload,
+        source,
+        idempotencyKey,
         tenantId: input.tenantId ?? null,
         agentId: input.agentId ?? null,
-        nonce: input.nonce ?? null,
+        nonce,
         authenticated: input.authenticated === true,
         authSubject: input.authSubject ?? null,
         createdAt: now(),
       };
+      boundedText(event.id, 'Event id', 256);
       this.db.prepare(`
         INSERT INTO events(
           id, topic, correlation_key, payload_json, source, idempotency_key,
@@ -1493,7 +1710,7 @@ export class Store {
         event.id,
         event.topic,
         event.correlationKey,
-        encode(event.payload),
+        payloadJson,
         event.source,
         event.idempotencyKey,
         event.tenantId,
@@ -1548,8 +1765,13 @@ export class Store {
         });
         awakened.push(task.id);
       }
-      return { event, awakened, duplicate: false };
-    });
+      return {
+        event: hydrateEvent(this.db.prepare('SELECT * FROM events WHERE id = ?').get(event.id)),
+        awakened,
+        duplicate: false,
+      };
+    };
+    return withinTransaction ? publish() : this.transaction(publish);
   }
 
   listEvents({ topic, correlationKey, limit = 100 } = {}) {
@@ -1856,8 +2078,26 @@ export class Store {
   }
 
   getOrCreateSession(input) {
+    boundedText(input.sessionKey, 'Session key', 1_024);
+    boundedText(input.agentId ?? 'main', 'Session agent id', 128);
+    boundedText(input.tenantId ?? 'default', 'Session tenant id', 128);
+    boundedText(input.channel ?? 'web', 'Session channel', 128);
+    boundedText(input.peerKey ?? 'owner', 'Session peer key', 256);
+    if (input.title != null && (typeof input.title !== 'string' || input.title.length > 500)) throw new Error('Session title exceeds 500 characters');
+    const metadataJson = boundedJson(input.metadata ?? {}, 'Session metadata', 500_000);
     const existing = this.db.prepare('SELECT * FROM sessions WHERE session_key = ?').get(input.sessionKey);
-    if (existing) return hydrateSession(existing);
+    if (existing) {
+      const expected = {
+        agent_id: input.agentId ?? 'main',
+        tenant_id: input.tenantId ?? 'default',
+        channel: input.channel ?? 'web',
+        peer_key: input.peerKey ?? 'owner',
+      };
+      for (const [field, value] of Object.entries(expected)) {
+        if (existing[field] !== value) throw new Error(`Session key is already owned by a different ${field}`);
+      }
+      return hydrateSession(existing);
+    }
     const timestamp = now();
     const id = input.id ?? randomUUID();
     this.db.prepare(`
@@ -1873,7 +2113,7 @@ export class Store {
       input.channel ?? 'web',
       input.peerKey ?? 'owner',
       input.title ?? null,
-      encode(input.metadata ?? {}),
+      metadataJson,
       timestamp,
       timestamp,
       timestamp,
@@ -1908,12 +2148,13 @@ export class Store {
     const session = this.getSession(idOrKey);
     if (!session) return null;
     const metadata = { ...session.metadata, ...patch };
+    const metadataJson = boundedJson(metadata, 'Session metadata', 500_000);
     const timestamp = now();
     this.db.prepare(`
       UPDATE sessions
       SET metadata_json = ?, updated_at = ?
       WHERE id = ?
-    `).run(encode(metadata), timestamp, session.id);
+    `).run(metadataJson, timestamp, session.id);
     return this.getSession(session.id);
   }
 
@@ -1960,6 +2201,18 @@ export class Store {
     if (!session) throw new Error(`Unknown session: ${input.sessionId}`);
     const timestamp = input.createdAt ?? now();
     const id = input.id ?? randomUUID();
+    if (typeof id !== 'string' || !id || id.length > 256) throw new Error('Message id must contain 1 to 256 characters');
+    if (!['user', 'assistant', 'system', 'tool'].includes(input.role)) throw new Error(`Unsupported message role: ${input.role}`);
+    const content = typeof input.content === 'string' ? { text: input.content } : input.content;
+    const encodedContent = encode(content);
+    if (Buffer.byteLength(encodedContent) > 2_000_000) throw new Error('Message content exceeds 2 MB');
+    const existing = this.getMessage(id);
+    if (existing) {
+      if (existing.session_id !== session.id || existing.role !== input.role || encode(existing.content) !== encodedContent) {
+        throw new Error(`Message id was reused with different ownership or content: ${id}`);
+      }
+      return existing;
+    }
     this.db.prepare(`
       INSERT OR IGNORE INTO messages(id, session_id, role, content_json, run_id, provenance, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1967,7 +2220,7 @@ export class Store {
       id,
       session.id,
       input.role,
-      encode(typeof input.content === 'string' ? { text: input.content } : input.content),
+      encodedContent,
       input.runId ?? null,
       input.provenance ?? (input.role === 'user' ? 'user' : 'agent'),
       timestamp,
@@ -1976,6 +2229,20 @@ export class Store {
       UPDATE sessions SET last_interaction_at = ?, updated_at = ? WHERE id = ?
     `).run(timestamp, timestamp, session.id);
     return hydrateMessage(this.db.prepare('SELECT * FROM messages WHERE id = ?').get(id));
+  }
+
+  appendMessageAndCreateGoal(messageInput, goalInput, taskInputs) {
+    return this.transaction(() => {
+      const message = this.appendMessage(messageInput);
+      if (message.run_id) {
+        const existing = this.getGoal(message.run_id);
+        if (!existing) throw new Error(`Message references an unknown goal: ${message.run_id}`);
+        return { message, goal: existing, tasks: this.listTasks(existing.id), duplicate: true };
+      }
+      const created = this.createGoalWithTasks(goalInput, taskInputs, { withinTransaction: true });
+      const linked = this.setMessageRunId(message.id, created.goal.id);
+      return { message: linked, ...created, duplicate: false };
+    });
   }
 
   getMessage(id) {
@@ -1988,29 +2255,22 @@ export class Store {
   }
 
   appendMessageAndEnqueueOutbox(messageInput, outboxInput) {
+    if (!outboxInput.idempotencyKey || String(outboxInput.idempotencyKey).length > 512) {
+      throw new Error('Outbox delivery requires an idempotency key of at most 512 characters');
+    }
     return this.transaction(() => {
       const session = this.getSession(messageInput.sessionId);
       if (!session) throw new Error(`Unknown session: ${messageInput.sessionId}`);
       const timestamp = messageInput.createdAt ?? now();
-      const messageId = messageInput.id ?? randomUUID();
-      this.db.prepare(`
-        INSERT OR IGNORE INTO messages(id, session_id, role, content_json, run_id, provenance, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        messageId,
-        session.id,
-        messageInput.role,
-        encode(typeof messageInput.content === 'string' ? { text: messageInput.content } : messageInput.content),
-        messageInput.runId ?? null,
-        messageInput.provenance ?? 'agent',
-        timestamp,
-      );
-      this.db.prepare('UPDATE sessions SET last_interaction_at = ?, updated_at = ? WHERE id = ?')
-        .run(timestamp, timestamp, session.id);
+      const message = this.appendMessage({ ...messageInput, createdAt: timestamp });
 
-      let outbox = outboxInput.idempotencyKey
-        ? this.db.prepare('SELECT * FROM outbox WHERE idempotency_key = ?').get(outboxInput.idempotencyKey)
-        : null;
+      let outbox = this.db.prepare('SELECT * FROM outbox WHERE idempotency_key = ?').get(outboxInput.idempotencyKey);
+      if (outbox && (
+        outbox.session_id !== session.id
+        || outbox.channel !== outboxInput.channel
+        || outbox.target !== outboxInput.target
+        || outbox.payload_json !== encode(outboxInput.payload)
+      )) throw new Error(`Outbox idempotency key was reused with different delivery content: ${outboxInput.idempotencyKey}`);
       if (!outbox) {
         const outboxId = outboxInput.id ?? randomUUID();
         this.db.prepare(`
@@ -2025,13 +2285,13 @@ export class Store {
           outboxInput.target,
           encode(outboxInput.payload),
           timestamp,
-          outboxInput.idempotencyKey ?? null,
+          outboxInput.idempotencyKey,
           timestamp,
         );
         outbox = this.db.prepare('SELECT * FROM outbox WHERE id = ?').get(outboxId);
       }
       return {
-        message: hydrateMessage(this.db.prepare('SELECT * FROM messages WHERE id = ?').get(messageId)),
+        message,
         outbox: hydrateOutbox(outbox),
       };
     });
@@ -2064,12 +2324,14 @@ export class Store {
     `).all(session.id, target.rowid, limit).reverse().map(hydrateMessage);
   }
 
-  addMemory(input) {
-    return this.transaction(() => {
+  addMemory(input, { withinTransaction = false } = {}) {
+    const create = () => {
       const timestamp = now();
       const id = input.id ?? randomUUID();
       const agentId = input.agentId ?? 'main';
       const tenantId = input.tenantId ?? 'default';
+      const status = input.status ?? 'ACTIVE';
+      if (!['ACTIVE', 'CANDIDATE'].includes(status)) throw new Error(`Invalid initial memory status: ${status}`);
       const superseded = input.supersedesId ? this.getMemory(input.supersedesId) : null;
       if (input.supersedesId && (!superseded || superseded.agent_id !== agentId || superseded.tenant_id !== tenantId)) {
         throw new Error(`Superseded memory is unavailable: ${input.supersedesId}`);
@@ -2080,7 +2342,7 @@ export class Store {
           status, tags_json, expires_at, valid_from, valid_until, provenance_json,
           supersedes_id, contradiction_group, last_confirmed_at, access_count,
           created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
       `).run(
         id,
         agentId,
@@ -2090,6 +2352,7 @@ export class Store {
         input.source ?? 'agent',
         Math.max(0, Math.min(1, Number(input.importance ?? 0.5))),
         Math.max(0, Math.min(1, Number(input.confidence ?? 0.7))),
+        status,
         encode(input.tags ?? []),
         input.expiresAt ?? null,
         input.validFrom ?? timestamp,
@@ -2097,7 +2360,7 @@ export class Store {
         encode(input.provenance ?? {}),
         input.supersedesId ?? null,
         input.contradictionGroup ?? superseded?.contradiction_group ?? (input.supersedesId ? `memory-chain:${input.supersedesId}` : null),
-        input.lastConfirmedAt ?? timestamp,
+        input.lastConfirmedAt === undefined ? timestamp : input.lastConfirmedAt,
         timestamp,
         timestamp,
       );
@@ -2115,7 +2378,8 @@ export class Store {
         this.db.prepare('UPDATE memories SET contradiction_group = ? WHERE id = ?').run(group, id);
       }
       return this.getMemory(id);
-    });
+    };
+    return withinTransaction ? create() : this.transaction(create);
   }
 
   getMemory(id) {
@@ -2177,6 +2441,78 @@ export class Store {
     `).all(agentId, tenantId, limit).map(hydrateMemory);
   }
 
+  startMemorySyncRun(input) {
+    const id = input.id ?? randomUUID();
+    boundedText(id, 'Memory sync run id', 256);
+    const providerId = boundedText(input.providerId, 'Memory provider id', 128);
+    const direction = boundedText(input.direction, 'Memory sync direction', 16);
+    if (!['PULL', 'PUSH', 'IMPORT', 'EXPORT'].includes(direction)) throw new Error('Memory sync direction is invalid');
+    const agentId = boundedText(input.agentId ?? 'main', 'Memory sync agent id', 128);
+    const tenantId = boundedText(input.tenantId ?? 'default', 'Memory sync tenant id', 128);
+    this.db.prepare(`
+      INSERT INTO memory_sync_runs(
+        id, provider_id, direction, status, agent_id, tenant_id, metadata_json, started_at
+      ) VALUES (?, ?, ?, 'RUNNING', ?, ?, '{}', ?)
+    `).run(id, providerId, direction, agentId, tenantId, now());
+    return this.getMemorySyncRun(id);
+  }
+
+  finishMemorySyncRun(id, status, input = {}) {
+    if (!['SUCCEEDED', 'FAILED', 'SKIPPED'].includes(status)) throw new Error('Memory sync status is invalid');
+    const run = this.getMemorySyncRun(id);
+    if (!run) throw new Error(`Unknown memory sync run: ${id}`);
+    if (run.status !== 'RUNNING') return run;
+    const digest = input.digest == null ? null : boundedText(input.digest, 'Memory bundle digest', 128);
+    const signatureStatus = input.signatureStatus == null
+      ? null
+      : boundedText(input.signatureStatus, 'Memory signature status', 64);
+    const imported = Number(input.imported ?? 0);
+    const duplicates = Number(input.duplicates ?? 0);
+    if (!Number.isInteger(imported) || imported < 0 || !Number.isInteger(duplicates) || duplicates < 0) {
+      throw new Error('Memory sync counts must be non-negative integers');
+    }
+    const error = input.error == null ? null : String(input.error).slice(0, 20_000);
+    const metadataJson = boundedJson(stable(input.metadata ?? {}), 'Memory sync metadata', 200_000);
+    this.db.prepare(`
+      UPDATE memory_sync_runs
+      SET status = ?, bundle_digest = ?, signature_status = ?, imported_count = ?,
+          duplicate_count = ?, error = ?, metadata_json = ?, finished_at = ?
+      WHERE id = ? AND status = 'RUNNING'
+    `).run(status, digest, signatureStatus, imported, duplicates, error, metadataJson, now(), id);
+    return this.getMemorySyncRun(id);
+  }
+
+  getMemorySyncRun(id) {
+    return hydrateMemorySyncRun(this.db.prepare('SELECT * FROM memory_sync_runs WHERE id = ?').get(id));
+  }
+
+  listMemorySyncRuns({ agentId = 'main', tenantId = 'default', providerId, limit = 100 } = {}) {
+    const boundedLimit = Math.max(1, Math.min(500, Number(limit) || 100));
+    const clauses = ['agent_id = ?', 'tenant_id = ?'];
+    const params = [agentId, tenantId];
+    if (providerId) {
+      clauses.push('provider_id = ?');
+      params.push(providerId);
+    }
+    return this.db.prepare(`
+      SELECT * FROM memory_sync_runs WHERE ${clauses.join(' AND ')}
+      ORDER BY started_at DESC LIMIT ?
+    `).all(...params, boundedLimit).map(hydrateMemorySyncRun);
+  }
+
+  pruneMemorySyncRuns({ agentId = 'main', tenantId = 'default', retain = 5_000 } = {}) {
+    const boundedRetain = Math.max(100, Math.min(100_000, Number(retain) || 5_000));
+    const result = this.db.prepare(`
+      DELETE FROM memory_sync_runs
+      WHERE agent_id = ? AND tenant_id = ? AND id IN (
+        SELECT id FROM memory_sync_runs
+        WHERE agent_id = ? AND tenant_id = ?
+        ORDER BY started_at DESC LIMIT -1 OFFSET ?
+      )
+    `).run(agentId, tenantId, agentId, tenantId, boundedRetain);
+    return Number(result.changes);
+  }
+
   setMemoryStatus(id, status, detail = {}) {
     const memory = this.getMemory(id);
     if (!memory) return null;
@@ -2191,7 +2527,8 @@ export class Store {
     const timestamp = now();
     this.db.prepare(`
       UPDATE memories
-      SET confidence = ?, last_confirmed_at = ?, provenance_json = ?, updated_at = ?
+      SET confidence = ?, status = CASE WHEN status = 'CANDIDATE' THEN 'ACTIVE' ELSE status END,
+          last_confirmed_at = ?, provenance_json = ?, updated_at = ?
       WHERE id = ?
     `).run(
       Math.max(memory.confidence, Math.min(1, Number(confidence ?? memory.confidence))),
@@ -2209,6 +2546,17 @@ export class Store {
 
   createApproval(input) {
     const id = input.id ?? randomUUID();
+    boundedText(id, 'Approval id', 512);
+    boundedText(input.action, 'Approval action', 256);
+    const risk = input.risk ?? 'high';
+    if (!['low', 'medium', 'high', 'critical'].includes(risk)) throw new Error('Approval risk is invalid');
+    const parametersJson = boundedJson(input.parameters ?? {}, 'Approval parameters', 500_000);
+    const goal = input.goalId ? this.getGoal(input.goalId) : null;
+    const task = input.taskId ? this.getTask(input.taskId) : null;
+    const session = input.sessionId ? this.getSession(input.sessionId) : null;
+    if (input.goalId && !goal) throw new Error(`Approval goal is unavailable: ${input.goalId}`);
+    if (input.taskId && (!task || task.goal_id !== input.goalId)) throw new Error('Approval task does not belong to the approval goal');
+    if (input.sessionId && (!session || task?.session_id !== session.id)) throw new Error('Approval session does not own the approval task');
     this.db.prepare(`
       INSERT INTO approvals(
         id, goal_id, task_id, session_id, action, risk, parameters_json, status, requested_at
@@ -2219,8 +2567,8 @@ export class Store {
       input.taskId ?? null,
       input.sessionId ?? null,
       input.action,
-      input.risk ?? 'high',
-      encode(input.parameters ?? {}),
+      risk,
+      parametersJson,
       now(),
     );
     return this.getApproval(id);
@@ -2238,6 +2586,7 @@ export class Store {
   }
 
   resolveApproval(id, decision, { resolvedBy = 'owner', note } = {}) {
+    if (!['approve', 'deny'].includes(decision)) throw new Error('Approval decision must be approve or deny');
     const approval = this.getApproval(id);
     if (!approval || approval.status !== 'PENDING') return approval;
     const status = decision === 'approve' ? 'APPROVED' : 'DENIED';
@@ -2248,19 +2597,59 @@ export class Store {
     return this.getApproval(id);
   }
 
+  resolveApprovalAndPublishEvent(id, decision, { resolvedBy = 'owner', note } = {}, eventInput = {}) {
+    if (!['approve', 'deny'].includes(decision)) throw new Error('Approval decision must be approve or deny');
+    return this.transaction(() => {
+      const current = this.getApproval(id);
+      if (!current) return null;
+      const expectedStatus = decision === 'approve' ? 'APPROVED' : 'DENIED';
+      if (current.status !== 'PENDING' && current.status !== expectedStatus) {
+        throw new Error(`Approval is already ${current.status.toLowerCase()}`);
+      }
+      const approval = current.status === 'PENDING'
+        ? this.resolveApproval(id, decision, { resolvedBy, note })
+        : current;
+      const effectiveDecision = approval.status === 'APPROVED' ? 'approve' : 'deny';
+      const effectiveNote = approval.resolution?.note ?? null;
+      const delivery = this.publishEvent({
+        ...eventInput,
+        topic: 'approval.resolved',
+        correlationKey: approval.id,
+        payload: { decision: effectiveDecision, status: approval.status, note: effectiveNote },
+        idempotencyKey: `approval-resolution:${approval.id}`,
+      }, { withinTransaction: true });
+      return { approval, delivery };
+    });
+  }
+
   createSchedule(input) {
     const timestamp = now();
     const id = input.id ?? randomUUID();
+    boundedText(id, 'Schedule id', 512);
+    boundedText(input.agentId ?? 'main', 'Schedule agent id', 128);
+    boundedText(input.tenantId ?? 'default', 'Schedule tenant id', 128);
+    boundedText(input.name, 'Schedule name', 500);
+    const kind = input.kind ?? (input.intervalMs ? 'INTERVAL' : 'ONCE');
+    if (!['ONCE', 'INTERVAL'].includes(kind)) throw new Error('Schedule kind must be ONCE or INTERVAL');
+    const nextRunAt = Number(input.nextRunAt);
+    if (!Number.isFinite(nextRunAt) || nextRunAt < 0) throw new Error('Schedule nextRunAt must be a timestamp');
+    const intervalMs = input.intervalMs == null ? null : Number(input.intervalMs);
+    if (intervalMs != null && (!Number.isInteger(intervalMs) || intervalMs < 1_000 || intervalMs > 31_536_000_000)) {
+      throw new Error('Schedule intervalMs must be between 1000 and 31536000000');
+    }
+    if (kind === 'INTERVAL' && intervalMs == null) throw new Error('Interval schedules require intervalMs');
+    if (kind === 'ONCE' && intervalMs != null) throw new Error('One-time schedules cannot define intervalMs');
+    const payloadJson = boundedJson(input.payload ?? {}, 'Schedule payload', 500_000);
     const existing = this.getSchedule(id);
     if (existing) {
-      const expectedKind = input.kind ?? (input.intervalMs ? 'INTERVAL' : 'ONCE');
       if (
         existing.agent_id !== (input.agentId ?? 'main')
         || existing.tenant_id !== (input.tenantId ?? 'default')
         || existing.name !== input.name
-        || existing.schedule_kind !== expectedKind
-        || existing.next_run_at !== input.nextRunAt
-        || JSON.stringify(existing.payload) !== JSON.stringify(input.payload ?? {})
+        || existing.schedule_kind !== kind
+        || existing.interval_ms !== intervalMs
+        || existing.next_run_at !== nextRunAt
+        || !sameJson(existing.payload, input.payload ?? {})
       ) {
         throw new Error(`Schedule id was reused with different input: ${id}`);
       }
@@ -2276,10 +2665,10 @@ export class Store {
       input.agentId ?? 'main',
       input.tenantId ?? 'default',
       input.name,
-      input.kind ?? (input.intervalMs ? 'INTERVAL' : 'ONCE'),
-      encode(input.payload ?? {}),
-      input.intervalMs ?? null,
-      input.nextRunAt,
+      kind,
+      payloadJson,
+      intervalMs,
+      nextRunAt,
       input.enabled === false ? 0 : 1,
       timestamp,
       timestamp,
@@ -2328,40 +2717,68 @@ export class Store {
   }
 
   enqueueOutbox(input) {
-    if (input.idempotencyKey) {
-      const existing = this.db.prepare('SELECT * FROM outbox WHERE idempotency_key = ?').get(input.idempotencyKey);
-      if (existing) return hydrateOutbox(existing);
+    const idempotencyKey = boundedText(input.idempotencyKey, 'Outbox idempotency key', 512);
+    const channel = boundedText(input.channel, 'Outbox channel', 128);
+    const target = boundedText(input.target, 'Outbox target', 1_024);
+    const sessionId = input.sessionId == null ? null : boundedText(input.sessionId, 'Outbox session id', 1_024);
+    const payload = input.payload ?? {};
+    const payloadJson = boundedJson(stable(payload), 'Outbox payload', 500_000);
+    const existing = this.db.prepare('SELECT * FROM outbox WHERE idempotency_key = ?').get(idempotencyKey);
+    if (existing) {
+      if (
+        existing.session_id !== sessionId
+        || existing.channel !== channel
+        || existing.target !== target
+        || !sameJson(decode(existing.payload_json, {}), payload)
+      ) throw new Error(`Outbox idempotency key was reused with different delivery content: ${idempotencyKey}`);
+      return hydrateOutbox(existing);
     }
     const timestamp = now();
     const id = input.id ?? randomUUID();
+    boundedText(id, 'Outbox id', 256);
     this.db.prepare(`
       INSERT INTO outbox(
         id, session_id, channel, target, payload_json, status, next_attempt_at,
         idempotency_key, created_at
       ) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)
-    `).run(id, input.sessionId ?? null, input.channel, input.target, encode(input.payload), timestamp, input.idempotencyKey ?? null, timestamp);
+    `).run(id, sessionId, channel, target, payloadJson, timestamp, idempotencyKey, timestamp);
     return hydrateOutbox(this.db.prepare('SELECT * FROM outbox WHERE id = ?').get(id));
   }
 
   recordChannelMessage(input) {
+    const channelId = boundedText(input.channelId, 'Channel id', 256);
+    const accountId = boundedText(input.accountId, 'Channel account id', 256);
+    const messageId = boundedText(input.messageId, 'Channel message id', 256);
+    const threadKey = boundedText(input.threadKey, 'Channel thread key', 256);
+    const sender = input.sender == null ? null : boundedText(input.sender, 'Channel sender', 1_000);
+    const text = input.text == null ? null : boundedText(input.text, 'Channel message text', 200_000);
+    const tenantId = boundedText(input.tenantId ?? 'default', 'Channel tenant id', 128);
+    const agentId = boundedText(input.agentId ?? 'main', 'Channel agent id', 128);
+    const payload = input.payload ?? {};
+    const payloadJson = boundedJson(stable(payload), 'Channel message payload', 500_000);
+    const receivedAt = Number(input.receivedAt ?? now());
+    if (!Number.isFinite(receivedAt) || receivedAt < 0) throw new Error('Channel receivedAt must be a timestamp');
     const existing = this.db.prepare(`
       SELECT * FROM channel_messages
       WHERE channel_id = ? AND account_id = ? AND external_message_id = ?
-    `).get(input.channelId, input.accountId, input.messageId);
+    `).get(channelId, accountId, messageId);
     if (existing) {
       const message = hydrateChannelMessage(existing);
       if (
-        message.thread_key !== input.threadKey
-        || message.sender !== (input.sender ?? null)
-        || message.text !== (input.text ?? null)
-        || JSON.stringify(message.payload) !== JSON.stringify(input.payload ?? {})
+        message.thread_key !== threadKey
+        || message.sender !== sender
+        || message.text !== text
+        || message.tenant_id !== tenantId
+        || message.agent_id !== agentId
+        || !sameJson(message.payload, payload)
       ) {
-        throw new Error(`Channel message id was reused with different content: ${input.messageId}`);
+        throw new Error(`Channel message id was reused with different content: ${messageId}`);
       }
       return { message, duplicate: true };
     }
     const timestamp = now();
     const id = input.id ?? randomUUID();
+    boundedText(id, 'Channel message record id', 256);
     this.db.prepare(`
       INSERT INTO channel_messages(
         id, channel_id, external_message_id, account_id, thread_key, sender, text,
@@ -2369,16 +2786,16 @@ export class Store {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
     `).run(
       id,
-      input.channelId,
-      input.messageId,
-      input.accountId,
-      input.threadKey,
-      input.sender ?? null,
-      input.text ?? null,
-      encode(input.payload ?? {}),
-      input.tenantId ?? 'default',
-      input.agentId ?? 'main',
-      input.receivedAt ?? timestamp,
+      channelId,
+      messageId,
+      accountId,
+      threadKey,
+      sender,
+      text,
+      payloadJson,
+      tenantId,
+      agentId,
+      receivedAt,
       timestamp,
     );
     return { message: this.getChannelMessage(id), duplicate: false };
@@ -2439,23 +2856,60 @@ export class Store {
 
   markOutboxDelivered(id) {
     this.db.prepare(`
-      UPDATE outbox SET status = 'DELIVERED', delivered_at = ?, attempt = attempt + 1 WHERE id = ?
+      UPDATE outbox SET status = 'DELIVERED', delivered_at = ?, attempt = attempt + 1
+      WHERE id = ? AND status IN ('PENDING', 'RETRY')
     `).run(now(), id);
   }
 
   markOutboxFailed(id, error) {
     const row = this.db.prepare('SELECT attempt FROM outbox WHERE id = ?').get(id);
+    if (!row) throw new Error(`Unknown outbox record: ${id}`);
     const attempt = Number(row?.attempt ?? 0) + 1;
+    const message = String(error ?? 'Unknown delivery error').slice(0, 20_000);
     this.db.prepare(`
       UPDATE outbox SET status = ?, attempt = ?, next_attempt_at = ?, last_error = ? WHERE id = ?
-    `).run(attempt >= 5 ? 'FAILED' : 'RETRY', attempt, now() + Math.min(60_000, 1_000 * 2 ** attempt), String(error), id);
+    `).run(attempt >= 5 ? 'FAILED' : 'RETRY', attempt, now() + Math.min(60_000, 1_000 * 2 ** attempt), message, id);
   }
 
   prepareOperation(input) {
-    const existing = this.db.prepare('SELECT * FROM operations WHERE idempotency_key = ?').get(input.idempotencyKey);
-    if (existing) return { operation: hydrateOperation(existing), duplicate: true };
+    const idempotencyKey = boundedText(input.idempotencyKey, 'Operation idempotency key', 512);
+    const goalId = boundedText(input.goalId, 'Operation goal id', 256);
+    const taskId = boundedText(input.taskId, 'Operation task id', 256);
+    const toolName = boundedText(input.toolName, 'Operation tool name', 256);
+    const mode = boundedText(input.mode, 'Operation mode', 64);
+    const resourcePool = boundedText(input.resourcePool ?? 'isolated-side-effects', 'Operation resource pool', 128);
+    if (!['idempotent', 'local-idempotent', 'reconcilable', 'non-idempotent'].includes(mode)) {
+      throw new Error(`Unsupported operation mode: ${mode}`);
+    }
+    const task = this.getTask(taskId);
+    if (!task || task.goal_id !== goalId || !this.getGoal(goalId)) {
+      throw new Error('Operation task and Goal ownership do not match');
+    }
+    const request = input.request ?? {};
+    const requestJson = boundedJson(stable(request), 'Operation request', 1_000_000);
+    const preparedJson = input.prepared === undefined
+      ? null
+      : boundedJson(stable(input.prepared), 'Prepared operation state', 1_000_000);
+    const nextReconcileAt = input.nextReconcileAt == null ? null : Number(input.nextReconcileAt);
+    if (nextReconcileAt != null && (!Number.isFinite(nextReconcileAt) || nextReconcileAt < 0)) {
+      throw new Error('Operation nextReconcileAt must be a timestamp');
+    }
+    const existing = this.db.prepare('SELECT * FROM operations WHERE idempotency_key = ?').get(idempotencyKey);
+    if (existing) {
+      const operation = hydrateOperation(existing);
+      if (
+        operation.goal_id !== goalId
+        || operation.task_id !== taskId
+        || operation.tool_name !== toolName
+        || operation.mode !== mode
+        || operation.resource_pool !== resourcePool
+        || !sameJson(operation.request, request)
+      ) throw new Error(`Operation idempotency key was reused with different content: ${idempotencyKey}`);
+      return { operation, duplicate: true };
+    }
     const timestamp = now();
     const id = input.id ?? randomUUID();
+    boundedText(id, 'Operation id', 256);
     this.db.prepare(`
       INSERT INTO operations(
         id, idempotency_key, goal_id, task_id, tool_name, mode,
@@ -2464,15 +2918,15 @@ export class Store {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?)
     `).run(
       id,
-      input.idempotencyKey,
-      input.goalId,
-      input.taskId,
-      input.toolName,
-      input.mode,
-      input.resourcePool ?? 'isolated-side-effects',
-      encode(input.request ?? {}),
-      encode(input.prepared),
-      input.nextReconcileAt ?? null,
+      idempotencyKey,
+      goalId,
+      taskId,
+      toolName,
+      mode,
+      resourcePool,
+      requestJson,
+      preparedJson,
+      nextReconcileAt,
       timestamp,
       timestamp,
     );
@@ -2505,8 +2959,35 @@ export class Store {
   transitionOperation(id, state, input = {}) {
     const operation = this.getOperation(id);
     if (!operation) return null;
+    const transitions = {
+      PREPARED: ['EXECUTING'],
+      EXECUTING: ['EXECUTING', 'CONFIRMED', 'UNCERTAIN', 'FAILED'],
+      UNCERTAIN: ['RECONCILING', 'EXECUTING'],
+      RECONCILING: ['CONFIRMED', 'ABSENT', 'UNCERTAIN'],
+      ABSENT: ['EXECUTING'],
+      FAILED: ['EXECUTING'],
+      CONFIRMED: ['COMPENSATING'],
+      COMPENSATING: ['COMPENSATED', 'COMPENSATION_UNCERTAIN'],
+      COMPENSATION_UNCERTAIN: ['COMPENSATING'],
+      COMPENSATED: [],
+    };
+    if (!transitions[operation.state]?.includes(state)) {
+      throw new Error(`Invalid operation transition: ${operation.state} -> ${state}`);
+    }
+    if (input.expectedState != null && operation.state !== input.expectedState) {
+      throw new Error(`Operation state changed concurrently: expected ${input.expectedState}, found ${operation.state}`);
+    }
+    const preparedJson = input.prepared === undefined ? null : boundedJson(stable(input.prepared), 'Prepared operation state', 1_000_000);
+    const resultJson = input.result === undefined ? null : boundedJson(stable(input.result), 'Operation result', 2_000_000);
+    const reconciliationJson = input.reconciliation === undefined ? null : boundedJson(stable(input.reconciliation), 'Operation reconciliation', 1_000_000);
+    const compensationJson = input.compensation === undefined ? null : boundedJson(stable(input.compensation), 'Operation compensation', 1_000_000);
+    const nextReconcileAt = input.nextReconcileAt == null ? null : Number(input.nextReconcileAt);
+    if (nextReconcileAt != null && (!Number.isFinite(nextReconcileAt) || nextReconcileAt < 0)) {
+      throw new Error('Operation nextReconcileAt must be a timestamp');
+    }
+    const error = input.error == null ? null : String(input.error).slice(0, 20_000);
     const timestamp = now();
-    this.db.prepare(`
+    const updated = this.db.prepare(`
       UPDATE operations
       SET state = ?, prepared_json = COALESCE(?, prepared_json),
           result_json = COALESCE(?, result_json),
@@ -2516,24 +2997,26 @@ export class Store {
           next_reconcile_at = ?, last_error = ?, updated_at = ?,
           confirmed_at = CASE WHEN ? = 'CONFIRMED' THEN ? ELSE confirmed_at END,
           compensated_at = CASE WHEN ? = 'COMPENSATED' THEN ? ELSE compensated_at END
-      WHERE id = ?
+      WHERE id = ? AND state = ?
     `).run(
       state,
-      input.prepared === undefined ? null : encode(input.prepared),
-      input.result === undefined ? null : encode(input.result),
-      input.reconciliation === undefined ? null : encode(input.reconciliation),
-      input.compensation === undefined ? null : encode(input.compensation),
+      preparedJson,
+      resultJson,
+      reconciliationJson,
+      compensationJson,
       input.incrementAttempt ? 1 : 0,
       input.incrementReconcile ? 1 : 0,
-      input.nextReconcileAt ?? null,
-      input.error ?? null,
+      nextReconcileAt,
+      error,
       timestamp,
       state,
       timestamp,
       state,
       timestamp,
       id,
+      operation.state,
     );
+    if (updated.changes !== 1) throw new Error('Operation state changed concurrently');
     return this.getOperation(id);
   }
 
@@ -2579,6 +3062,18 @@ export class Store {
   createMonitor(input) {
     const timestamp = now();
     const id = input.id ?? randomUUID();
+    boundedText(id, 'Monitor id', 512);
+    boundedText(input.agentId ?? 'main', 'Monitor agent id', 128);
+    boundedText(input.tenantId ?? 'default', 'Monitor tenant id', 128);
+    boundedText(input.name, 'Monitor name', 500);
+    boundedText(input.sensorType, 'Monitor sensor type', 128);
+    const intervalMs = Number(input.intervalMs);
+    if (!Number.isInteger(intervalMs) || intervalMs < 10 || intervalMs > 31_536_000_000) {
+      throw new Error('Monitor intervalMs must be between 10 and 31536000000');
+    }
+    const nextPollAt = Number(input.nextPollAt ?? timestamp);
+    if (!Number.isFinite(nextPollAt) || nextPollAt < 0) throw new Error('Monitor nextPollAt must be a timestamp');
+    const configJson = boundedJson(input.config ?? {}, 'Monitor config', 500_000);
     const existing = this.getMonitor(id);
     if (existing) {
       if (
@@ -2586,8 +3081,8 @@ export class Store {
         || existing.tenant_id !== (input.tenantId ?? 'default')
         || existing.name !== input.name
         || existing.sensor_type !== input.sensorType
-        || existing.interval_ms !== input.intervalMs
-        || JSON.stringify(existing.config) !== JSON.stringify(input.config ?? {})
+        || existing.interval_ms !== intervalMs
+        || !sameJson(existing.config, input.config ?? {})
       ) {
         throw new Error(`Monitor id was reused with different input: ${id}`);
       }
@@ -2604,9 +3099,9 @@ export class Store {
       input.tenantId ?? 'default',
       input.name,
       input.sensorType,
-      encode(input.config ?? {}),
-      input.intervalMs,
-      input.nextPollAt ?? timestamp,
+      configJson,
+      intervalMs,
+      nextPollAt,
       input.enabled === false ? 0 : 1,
       timestamp,
       timestamp,
@@ -2881,7 +3376,15 @@ export class Store {
 
   createInterrupt(input) {
     const id = input.id ?? randomUUID();
-    const priority = Math.max(0, Math.min(100, Number(input.priority ?? 100)));
+    boundedText(id, 'Interrupt id', 256);
+    boundedText(input.agentId ?? 'main', 'Interrupt agent id', 128);
+    boundedText(input.kind ?? 'user', 'Interrupt kind', 128);
+    const requestedPriority = Number(input.priority ?? 100);
+    if (!Number.isFinite(requestedPriority)) throw new Error('Interrupt priority must be a finite number');
+    const priority = Math.max(0, Math.min(100, Math.round(requestedPriority)));
+    const reason = input.reason ?? 'A higher-priority instruction requires attention';
+    boundedText(reason, 'Interrupt reason', 4_000);
+    const payloadJson = boundedJson(input.payload ?? {}, 'Interrupt payload', 500_000);
     this.db.prepare(`
       INSERT INTO interrupts(
         id, agent_id, goal_id, target_task_id, kind, priority, force,
@@ -2895,8 +3398,8 @@ export class Store {
       input.kind ?? 'user',
       priority,
       input.force === false ? 0 : 1,
-      input.reason ?? 'A higher-priority instruction requires attention',
-      encode(input.payload ?? {}),
+      reason,
+      payloadJson,
       now(),
     );
     return this.getInterrupt(id);
@@ -2983,6 +3486,8 @@ export class Store {
       events: this.db.prepare('SELECT COUNT(*) AS count FROM events').get().count,
       sessions: this.db.prepare('SELECT COUNT(*) AS count FROM sessions').get().count,
       memories: this.db.prepare('SELECT COUNT(*) AS count FROM memories').get().count,
+      memoryCandidates: this.db.prepare("SELECT COUNT(*) AS count FROM memories WHERE status = 'CANDIDATE'").get().count,
+      failedMemorySyncs: this.db.prepare("SELECT COUNT(*) AS count FROM memory_sync_runs WHERE status = 'FAILED'").get().count,
       pendingApprovals: this.db.prepare("SELECT COUNT(*) AS count FROM approvals WHERE status = 'PENDING'").get().count,
       enabledSchedules: this.db.prepare('SELECT COUNT(*) AS count FROM schedules WHERE enabled = 1').get().count,
       pendingOutbox: this.db.prepare("SELECT COUNT(*) AS count FROM outbox WHERE status IN ('PENDING', 'RETRY')").get().count,

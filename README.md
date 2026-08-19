@@ -1,90 +1,92 @@
 # Agent OS
 
-一个以异步内核为第一原则、通过终端使用的个人 Agent 系统。它吸收成熟 Agent Gateway 的 CLI、会话、模型、工具、记忆、审批、自动化、插件和渠道边界，但把跨时间存在的 Goal/Task DAG、可挂起的思考线程和持续感知作为系统内核。
+An asynchronous-kernel-first, terminal-native personal agent system. It adopts mature Agent Gateway concepts for CLI, sessions, models, tools, memory, approvals, automation, plugins, and channel boundaries, while placing cross-time Goal/Task DAGs, suspendable thinking threads, and persistent perception at the core of the runtime.
 
-在 Agent OS 中，会话不是进程：终端退出、模型请求结束、用户暂时不回复、外部系统等待数天或 Gateway 重启，都不会让目标消失。
+In Agent OS, a session is not a process. Terminal exits, model requests ending, temporary user silence, external systems waiting days, or Gateway restarts do not erase the goal.
 
-当前版本是纯 headless 架构，没有前端控制台。Kernel Daemon 是一个真正持续存活的 Node.js 宿主进程：它在没有任务时仍监督 Scheduler、I/O Reactor、Interrupt Reactor、Cognition Loop 和外部 Listener。SQLite 持久化用于崩溃恢复，不再被当作常驻进程的替代品。
+The current version is fully headless with no web console. The Kernel Daemon is a continuously alive Node.js host process: even when idle it keeps supervising Scheduler, I/O Reactor, Interrupt Reactor, Cognition Loop, and external Listeners. SQLite persistence provides crash recovery and is not used as a replacement for long-running processes.
 
-## 核心能力
+## Core capabilities
 
-- 每条 Agent 消息立即持久化为 Goal 和 Task DAG
+- Every Agent message is immediately persisted as a Goal and Task DAG
 - `CREATED / READY / RUNNING / WAITING / BLOCKED / PAUSED / SUCCEEDED / FAILED / CANCELLED`
-- 每个 Task 都是独立思考线程，拥有 workflow、`pc`、variables、tool state、event subscription 和 checkpoints
-- 常驻 Kernel Daemon、宿主 PID、generation、子服务 heartbeat、故障记录和 singleton lease
-- `gateway start` 可脱离终端后台运行；`gateway run` 用于前台调试
-- 模型 tool call 可返回 suspend signal，保存可公开的外部推理状态并释放 Worker
-- 全局 Ready Queue、任务依赖、优先级、有界并发、公平时间片、Worker lease 和过期恢复
-- Goal 创建时原子冻结 `Goal Contract`：deadline、token/费用/工具/时间/context/fan-out 预算和能力集合
-- 系统全局与 Agent 每日配额、deadline-aware 调度，以及 default/memory/filesystem/network/browser/code/side-effect 资源池
-- Capability-based security：父子 Goal 能力单调收窄、文件/域名/账号/数据/凭证范围、到期、撤销和审计
-- Secret 只以 credential reference 进入 Goal；受信工具在最终执行边界短暂解析环境凭证，snapshot 和 API 不返回 locator 或 secret
-- 浏览器和代码类 Tool 必须绑定已注册 Sandbox adapter；非幂等 Tool 自动进入单槽隔离池和审批门
-- 统一外部副作用 operation record：`PREPARED / EXECUTING / UNCERTAIN / RECONCILING / CONFIRMED / COMPENSATED`
-- 可查询外部状态的 Tool 支持自动 reconciliation 与 compensation；执行中崩溃的非幂等操作不会盲目重放
-- Durable Interrupt、长模型调用 AbortSignal、安全抢占和紧急任务完成后的原线程恢复
-- 每个 Goal 冻结自己的 transcript 边界，避免同 Session 后续指令污染旧思考线程
-- 事件先进入持久 inbox；早到、晚到和重复事件都有确定语义
-- SQLite WAL、revision、幂等键、重试、可靠 Outbox 和 append-only audit ledger
-- Session、Message provenance、多 Agent workspace 和跨会话长期记忆
-- SQLite FTS5 记忆检索，并同步写入 `workspace/memory/YYYY-MM-DD.md`
-- 高风险工具自动进入 durable approval gate
-- 一次性/固定间隔计划任务，到期创建新的持久目标
-- 系统空闲时仍写入 pulse，并持续运行持久 Monitor
-- 工作区 inbox 同时使用操作系统实时文件事件和持久轮询兜底
-- Attention Allocator 按 deadline risk、计划漂移、新观察、Goal 冲突、长期阻塞和预期收益/成本决定是否唤醒认知循环
-- 每个 Goal 具有持久化 Plan Version 与显式可证伪 Assumption；匹配观察会让旧计划失效并创建受限的认知修复线程
-- 修复结果会注入原思考线程的已保存 action state，等待结束后从修订后的认知现场继续，而不是重放已完成工作
-- Goal 可声明 shared/exclusive 语义资源；Scheduler 会持久化持有记录并串行化账号、文档或业务对象上的冲突操作
-- 长期记忆具有 source、confidence、temporal validity、provenance、supersession 与 contradiction 状态，不再被当成永久真理
-- Provider、Tool、Action、Channel、Hook、Sensor 和常驻 Listener 插件边界
-- 终端交互、JSON 输出、状态表、任务 watch、日志 follow、事件注入和人工控制
-- REST/SSE headless Gateway、认证、限流、health、metrics 和 diagnostics
-- 首次启动分步完成模型、密钥、工作区、访问边界、预算、认知与审批配置
-- 独立的 Kernel Owl 卡通形象，以及持续刷新的终端 OS 面板
-- 对话历史与长期记忆分层管理，支持干净上下文、整段清理与单条遗忘
+- Each Task is an independent thinking thread, owning workflow, `pc`, variables, tool state, event subscriptions, and checkpoints
+- Persistent kernel daemon, host PID, generation, sub-service heartbeat, failure record, and singleton lease
+- `gateway start` runs in background detached from terminal; `gateway run` is for foreground debugging
+- Model tool calls can emit suspend signals, persist public external-reasoning state, and release workers
+- Global Ready Queue, task dependencies, priority, bounded concurrency, fair time slicing, Worker lease, and recovery on expiry
+- Atomic freeze of `Goal Contract` at creation: deadline, token/cost/tool/time/context/fan-out budgets, and capability sets
+- Global and per-Agent daily quotas, deadline-aware scheduling, and default/memory/filesystem/network/browser/code/side-effect resource pools
+- Capability-based security: parent/child Goal capabilities shrink monotonically, scoped file/domain/account/data/credential permissions, expiry, revocation, and audit trail
+- Secrets enter Goals only as credential references; trusted tools briefly resolve environment credentials at execution boundary, and snapshots/APIs never return locator or secret values
+- Browser and code tools must be bound to a trusted Sandbox adapter with declared process/container/microVM isolation; the kernel does not treat normal in-process wrappers as a sandbox
+- Unified external-side-effect operation records: `PREPARED / EXECUTING / UNCERTAIN / RECONCILING / CONFIRMED / COMPENSATED`
+- Tools that can query external state support automatic reconciliation and compensation; non-idempotent work in failure does not get blind replays
+- Durable Interrupt, long-running-model call AbortSignal, safe preemption, and restoration of interrupted thread after urgent completion
+- Each Goal freezes its own transcript boundary to prevent later session instructions from contaminating existing thought threads
+- Events land in a durable inbox first; early, late, and duplicate events have deterministic semantics
+- SQLite WAL, private file permissions, schema migration ledger, startup integrity checks, revision, idempotency keys, retries, reliable outbox, and append-only audit ledger
+- Session, message provenance, multi-agent workspace, and cross-session long-term memory
+- SQLite FTS5 memory retrieval, and synchronized writes to `workspace/memory/YYYY-MM-DD.md`
+- High-risk tools automatically enter durable approval gates
+- One-off and periodic schedules create new persistent goals on expiry
+- The system continues writing pulse during idle periods and keeps persistent Monitor running
+- Workspace inbox uses OS real-time file events with persistent polling as backup
+- Attention Allocator decides wake-ups using deadline risk, schedule drift, new observations, Goal conflicts, long-term blocking, and expected utility/cost
+- Each Goal has persisted Plan Version and explicit falsifiable assumptions; matching observations invalidate stale plans and create constrained cognition-repair threads
+- Repair outcomes are injected into the saved action state of the original thinking thread and resumed after completion from the revised cognitive context rather than replaying completed work
+- Goals can declare shared/exclusive semantic resources; Scheduler persists holds and serializes conflicting operations over accounts, documents, or business objects
+- Long-term memory stores source, confidence, temporal validity, provenance, supersession, and contradiction states; it is no longer treated as permanent truth
+- Versioned, content-addressed, Ed25519-verifiable, and AES-256-GCM-encryptable Memory Bundle, importable/exportable/sync-ready through local snapshots, CAS, or HTTPS providers
+- Boundaries for Provider, Tool, Action, Channel, Hook, Sensor, and persistent Listener plugins
+- Terminal interaction, JSON output, status tables, task watch, log follow, event injection, and human control
+- Headless REST/SSE Gateway, auth, rate limiting, health, metrics, and diagnostics
+- First-run onboarding configures model, secrets, workspace, boundaries, budgets, cognition, and approval policies
+- Separate Kernel Owl terminal mascot, plus continuously refreshed terminal OS panel
+- Layered dialog history and long-term memory management, supporting clean context, full history purge, and single-memory forget
 
-与 OpenClaw 的能力对照见 [OpenClaw architecture comparison](docs/openclaw-comparison.md)，内核状态机和一致性语义见 [Agent OS architecture](docs/architecture.md)。
+See architecture and semantics in [OpenClaw architecture comparison](docs/openclaw-comparison.md) and [Agent OS architecture](docs/architecture.md).
 
-## 快速开始
+## Quick start
 
-需要 Node.js 22.5 或更新版本。核心运行时没有第三方依赖。
+Supported Node.js versions: 22.22.3, 24.15.0, or 25.9.0 release lines and patch releases. Node.js 24 LTS is recommended. The core runtime has no third-party runtime dependencies.
 
-直接进入 Agent OS：
+Start Agent OS directly:
 
 ```bash
 node src/cli.js
 ```
 
-第一次运行会进入分步引导，依次设置 Agent 与 workspace、Gateway 访问范围、模型与凭证、资源预算、后台认知和副作用审批策略。确认后会启动脱离终端的长期 Gateway，再进入实时终端桌面。后续可随时重新配置：
+The first run enters guided onboarding and sequentially configures Agent and workspace, Gateway access scope, model and credential settings, resource budgets, background cognition, and side-effect approval policy. After confirmation it starts a persistent background Gateway and then opens the live terminal shell. You can reconfigure at any time:
 
 ```bash
 node src/cli.js setup
 node src/cli.js model
 ```
 
-观察和单独提交工作：
+Observe and submit work independently:
 
 ```bash
 node src/cli.js status
+node src/cli.js security audit
 node src/cli.js run "Plan my next product release and ask only for missing constraints"
 node src/cli.js chat
 ```
 
-如果将本项目安装或 link 为 npm package，命令名是 `agent-os`：
+If installed or linked as an npm package, the command is `agent-os`:
 
 ```bash
 agent-os gateway start
 agent-os status
-agent-os                                               # 首次引导，之后进入实时终端桌面
-agent-os chat                                          # 等价的显式命令
+agent-os                                               # First run onboarding, then open the live terminal shell
+agent-os chat                                          # Equivalent explicit command
 ```
 
-未配置模型时系统使用英文 offline provider，但 Goal、Task、会话、记忆、调度、感知和可靠交付链路仍会完整运行。
+When no model is configured, the system uses the built-in English offline provider, while Goal, Task, session, memory, scheduling, perception, and reliable delivery continue to run end-to-end.
 
-## 模型与状态目录
+## Model and state directory
 
-[.env.example](.env.example) 是环境变量参考。推荐先运行 `agent-os setup`。如果选择私密文件，模型 key 与 Gateway token 会写入 `security.secretFile`，主配置只保留引用；两个文件都以 `0600` 权限原子写入。也可以选择由 shell、进程管理器或容器注入环境变量：
+[.env.example](.env.example) is the environment reference. Running `agent-os setup` first is recommended. If you choose secret files, model keys and Gateway token are stored in `security.secretFile` and the main config keeps only references; both files are written atomically with `0600` permissions. You can also inject secrets via shell, process manager, or container environment variables:
 
 ```bash
 AGENT_OS_HOME="$HOME/.agent-os" \
@@ -93,61 +95,65 @@ AGENT_MODEL_ID=your-model \
 npm start
 ```
 
-默认状态目录是项目内的 `data/`。`init` 只创建配置基线，不执行产品引导；通常应使用 `setup`：
+Default state directory is project `data/`. `init` only creates configuration baseline and does not run full onboarding; normally use `setup`:
 
 ```bash
 AGENT_OS_HOME="$HOME/.agent-os" node src/cli.js setup
 ```
 
-完整示例见 [config.example.json](config.example.json)。关键配置包括：
+See a full sample in [config.example.json](config.example.json). Key config fields include:
 
-- `gateway.bind`：默认 `127.0.0.1`
-- `gateway.auth.tokenEnv/tokenRef`：非 loopback 部署必须通过引用解析出 token
-- `runtime.maxConcurrency`：可同时运行的思考线程数量
-- `runtime.tickMs`：就绪任务、计时器、计划和感知检查周期
-- `runtime.leaseMs`：Task 与 Monitor 执行租约
-- `kernel.*`：常驻服务 heartbeat、watchdog、I/O 周期和抢占优先级
-- `sensing.*`：pulse、Monitor 并发和默认工作区 inbox sensor
-- `cognition.*`：空闲认知、自动反思、冷却时间和每日 Goal 预算
-- `resources.goalDefaults/globalDaily/agentDaily`：Goal 预算与系统/Agent 配额
-- `resources.pools`：不同执行资源的独立并发容量
-- `operations.*`：不确定副作用的 reconciliation 周期和次数上限
-- `security.tenantId`：当前 Gateway 所有者 tenant；跨 tenant 请求会被拒绝
-- `security.capabilities`：根 Goal 可冻结能力的最大上界
-- `security.events`：外部事件 HMAC 密钥引用、时间窗和 replay protection
-- `security.approvalRisk`：达到该风险级别的工具需要批准
-- `security.tools.allow/deny`：全局工具能力策略
-- `security.pluginPaths`：唯一允许加载的本地插件路径
-- `agents[]`：Agent 身份、workspace 和模型绑定
-- `models.*`：OpenAI-compatible endpoint 或插件 Provider
-- `memory.captureMode`：当前为 `explicit`，普通对话不会自动升级为长期记忆
-- `onboarding.*`：记录是否已经完成首次产品引导
+- `gateway.bind`: default `127.0.0.1`
+- `gateway.auth.tokenEnv/tokenRef`: all Gateway traffic, including loopback, resolves token via reference; unresolved SecretRef causes startup failure
+- `runtime.maxConcurrency`: number of concurrent thinking threads
+- `runtime.tickMs`: scan frequency for ready tasks, timers, schedules, and perception checks
+- `runtime.leaseMs`: Task and Monitor execution lease duration
+- `kernel.*`: daemon heartbeat, watchdog, I/O cycle, and preemption priority
+- `sensing.*`: pulse, monitor concurrency, and default workspace inbox sensor
+- `cognition.*`: idle cognition, auto reflection, cooldown, and daily Goal budget
+- `resources.goalDefaults/globalDaily/agentDaily`: Goal budgets and system/Agent quotas
+- `resources.pools`: separate concurrency caps per resource
+- `operations.*`: reconciliation interval and retry limits for uncertain side effects
+- `security.tenantId`: owning tenant for the current Gateway; cross-tenant requests are rejected
+- `security.capabilities`: maximum capability envelope for root Goal
+- `security.events`: external event HMAC secret refs, window, and replay protection
+- `security.approvalRisk`: minimum tool risk requiring approval
+- `security.tools.allow/deny`: global tool capability policy
+- `security.pluginPaths`: explicit allowlist of local plugin paths
+- `security.plugins`: plugin ID allowlist, private file requirements, fail-closed plugin load policy
+
+Run `agent-os security audit` before production deployment. `--fix` only patches supported POSIX permission issues and does not auto-expand or shrink goal capabilities. A single Gateway is a trusted operator security domain, and Session key is for routing, not identity authentication. Untrusted users or tenants must isolate OS users, Gateway, database, workspace, credentials, and sandbox. Full boundaries, deployment requirements, and known constraints are in [SECURITY.md](SECURITY.md).
+- `agents[]`: Agent identity, workspace, and model binding
+- `models.*`: OpenAI-compatible endpoint or plugin Provider
+- `memory.captureMode`: currently `explicit`, ordinary dialog does not auto-promote to long-term memory
+- `memory.portability`: Memory Bundle size/count, remote signature and encryption requirements, trusted signer, key rotation, provider settings, and automatic pull/push cycle
+- `onboarding.*`: tracks whether first-run setup has been completed
 
 ## CLI
 
-查看完整命令树：
+Show full command tree:
 
 ```bash
 node src/cli.js --help
 ```
 
-核心交互：
+Core interactions:
 
 ```bash
-agent-os gateway run                              # 前台运行
-agent-os gateway start|stop|restart|status        # 后台进程控制
+agent-os gateway run                                 # Foreground execution
+agent-os gateway start|stop|restart|status             # Background daemon control
 agent-os kernel status
 agent-os kernel processes
 agent-os gateway status
 agent-os doctor
-agent-os setup                                      # 首次引导或重新配置
-agent-os run "Research this topic"              # 跟随执行，遇到用户输入或审批时在 TTY 中询问
-agent-os run "Research this topic" --detach     # 只提交，不等待
+agent-os setup                                      # Initial onboarding or reconfiguration
+agent-os run "Research this topic"                 # Executes and prompts on user input or approval in TTY
+agent-os run "Research this topic" --detach         # Submit only, do not wait
 agent-os run "Handle this now" --priority 100 --interrupt
-agent-os chat                                    # 交互式长期 Session
+agent-os chat                                       # Interactive long-lived Session
 ```
 
-观察思考线程和执行账本：
+Observe thinking threads and execution ledger:
 
 ```bash
 agent-os goals list
@@ -174,7 +180,7 @@ agent-os logs --follow
 agent-os logs --follow --goal <goal-id>
 ```
 
-长期服务：
+Long-running services:
 
 ```bash
 agent-os sessions list
@@ -188,6 +194,14 @@ agent-os memory confirm <memory-id> --confidence 0.98
 agent-os memory retract <memory-id> --reason "Corrected by the owner"
 agent-os memory forget <memory-id> --yes
 agent-os memory explain
+agent-os memory export ./memory-backup.json
+agent-os memory import ./memory-backup.json
+agent-os memory import ./memory-backup.json --activate
+agent-os memory providers
+agent-os memory push personal-cloud
+agent-os memory pull personal-cloud
+agent-os memory pull decentralized-cas --digest sha256:<digest>
+agent-os memory syncs
 agent-os approvals list
 agent-os approvals approve|deny <approval-id>
 agent-os schedules list
@@ -205,61 +219,140 @@ agent-os events emit ci.completed repo:main:run:42 --source cli \
 agent-os tools
 ```
 
-所有读取类命令支持 `--json`，Gateway 远程地址使用 `--gateway <url>`，认证使用 `--token <token>`。
+All read commands support `--json`. Gateway remote address is passed by `--gateway <url>`, and auth uses `--token <token>`.
 
-交互终端使用独立设计的 **Kernel Owl** 卡通形象：它会眨眼、观察，并在启动后进入常驻的终端 OS 面板。面板每 750ms 刷新 Kernel 存活状态、RUNNING/READY/WAITING/BLOCKED 思考线程、当前 Goal、长期记忆、Session、注意力判断和隔离资源池；下方保留可滚动交互区。
+Interactive terminal uses a dedicated **Kernel Owl** mascot that blinks, watches, and enters a persistent terminal OS panel after startup. The panel refreshes every 750ms and displays kernel liveness, RUNNING/READY/WAITING/BLOCKED threads, current Goal, long-term memory, Session, attention judgments, and isolated resource pools; a scrollable interaction area remains below.
 
-终端内常用控制：
+Common terminal controls:
 
 ```text
-/                     在光标下方打开命令下拉框并实时过滤
-/task <instruction>  并行提交后台 Goal，立即返回输入提示；/bg 是别名
-/focus <goal-id>     把后续工作绑定为这个 Goal 的子思考线程
-/unfocus             返回全局注意力视角
-/inbox               查看等待用户、审批和近期完成项
-/channels            查看常驻入站监听器与出站 Channel
-/reply [id] <text>   精确恢复一个等待用户输入的线程
-/interrupt <text>    创建紧急 Goal 并安全抢占低优先级工作
-/model [key]         查看或切换当前 Session 后续 Goal 使用的模型；default 恢复默认
-/manager             查看可解释思考线程、运行原因、资源、checkpoint 与 capability
-/inspect <task-id>   展开一个线程的等待条件、抢占原因和证据
-/trace <goal-id>     回放 Goal DAG、审计因果链和证据集合
-/plan <goal-id>      查看 Plan Version、Assumption、失效事件与修复线程
-/pause <task-id>     在安全 checkpoint 暂停线程
-/resume <task-id>    恢复已暂停线程
-/cancel <task-id>    取消线程
-/priority <id> <n>   调整调度优先级并写入审计
-/budget <id> <k> <v> 在冻结上限内调整 Goal 预算
-/revoke <goal-id>    撤销 Goal 的全部 capability
-/tasks              查看思考线程
-/goals              查看持久目标
-/history            查看当前 Session 对话历史
-/new                切换到干净上下文，不删除旧数据
-/purge              删除当前 Session 历史与已完成 Goal
-/memory [query]     查看或搜索显式长期记忆
-/forget <memory-id> 永久删除一条长期记忆
-/quit               退出终端；后台 Gateway 和任务继续运行
+/                     Open the command palette below cursor and filter in real time
+/task <instruction>  Submit a background Goal in parallel and return to prompt immediately; /bg is an alias
+/focus <goal-id>     Bind following work as a child thread of this Goal
+/unfocus             Return to global attention context
+/inbox               View pending user input, approvals, and recently completed items
+/channels            View persistent inbound listeners and outbound channels
+/reply [id] <text>   Restore a specific waiting user-input thread
+/interrupt <text>    Create an urgent Goal and safely preempt lower-priority work
+/model [key]         View or switch the model used by the current Session; default restores default model
+/manager             View explainable thread reasoning, run cause, resources, checkpoints, and capabilities
+/inspect <task-id>   Expand a thread wait condition, preemption reason, and evidence
+/trace <goal-id>     Replay Goal DAG, audit causality chain, and evidence set
+/plan <goal-id>      View Plan Version, Assumptions, invalidation events, and repair threads
+/pause <task-id>     Pause a thread at a safe checkpoint
+/resume <task-id>    Resume a paused thread
+/cancel <task-id>    Cancel a thread
+/priority <id> <n>   Adjust scheduling priority and write an audit record
+/budget <id> <k> <v> Adjust Goal budget within frozen constraints
+/revoke <goal-id>    Revoke all capabilities of a Goal
+/tasks               List thinking threads
+/goals               View persistent goals
+/history             View current Session conversation history
+/new                 Switch to clean context without deleting historical data
+/purge               Delete current Session history and completed Goals
+/memory [query]      View or search explicit long-term memory
+/forget <memory-id>  Permanently delete one long-term memory
+/quit                Exit terminal; background Gateway and goals keep running
 ```
 
-输入 `/` 时，输入光标下方会打开独立命令下拉框，实时显示命令语法与用途。继续输入 `/fo`、`/mem` 等前缀会立即过滤；使用 ↑/↓ 移动选择，PageUp/PageDown 翻页，Tab 或 Enter 选择，Esc 关闭。这个下拉框属于输入编辑器，不占用上方 Kernel Owl 状态面板。`/commands` 显示完整目录。
+Pressing `/` opens an independent command palette under the input cursor, showing command syntax and usage. Typing `/fo`, `/mem`, and similar prefixes filters instantly; use ↑/↓, PageUp/PageDown, Tab/Enter to select, and Esc to close. The palette belongs to the input editor and does not consume the top Kernel Owl panel. `/commands` shows the full catalog.
 
-`/model` 会向已配置 Provider 的 `/models` 接口实时发现模型，并打开可搜索的键盘选择器；直接输入字符即可过滤，↑/↓ 移动，PageUp/PageDown 翻页，Enter 选择。菜单前部同时提供 OpenAI、OpenRouter、DeepSeek、Custom 和 Offline 配置入口，选择后只新增一个命名模型配置，保存后自动重启 Gateway 并立即切换，不会重新询问或覆盖其他 OS 设置。`/model status` 查看状态，`/model default` 恢复 Agent 默认模型。模型选择会写入 Session，但每个 Goal 在创建时会冻结 Provider 配置键和实际模型 ID，因此已经 RUNNING 或 WAITING 的思考线程不会在恢复时意外切换模型。
+`/model` discovers models in real time from the configured Provider `/models` endpoint and opens a searchable keyboard picker. Type to filter and use ↑/↓, PageUp/PageDown, Enter to choose. The top area also exposes OpenAI, OpenRouter, DeepSeek, Custom, and Offline config entries; choosing one adds a single named model profile, and after save it automatically restarts Gateway and switches immediately without revisiting or overriding other OS settings. `/model status` checks status, and `/model default` restores the Agent default model. Model selection is written to the Session, but each Goal freezes provider key and actual model ID at creation so running or waiting Goals do not accidentally switch model upon resumption.
 
-窄终端自动退化为普通交互输出；非 TTY、CI 和 `TERM=dumb` 不播放动画。`--no-animation` 或 `AGENT_OS_NO_ANIMATION=1` 仅关闭开场动画，`--simple-ui` 或 `AGENT_OS_SIMPLE_UI=1` 关闭常驻面板，`--no-color`/`NO_COLOR` 关闭颜色。
+Narrow terminals degrade to plain interactive output. Non-TTY, CI, and `TERM=dumb` disable animations. `--no-animation` or `AGENT_OS_NO_ANIMATION=1` only disables startup animation. `--simple-ui` or `AGENT_OS_SIMPLE_UI=1` disables the persistent panel. `--no-color` or `NO_COLOR` disables colors.
 
-## 对话历史与长期记忆
+## Conversation history and long-term memory
 
-每一句输入都会先写入当前 Session，这是为了让中断、等待和重启后的 Goal 能恢复上下文；它不等于长期记忆。只有 `memory add`、`memory_remember` 或用户明确要求记住时，系统才创建可跨 Session 召回的长期记忆。
+Every input is first written to the current Session so interrupted, waiting, and restarted Goals can restore context. It is not equivalent to long-term memory. Long-term memory is only created when `memory add`, `memory_remember`, or explicit user instruction requests recall memory.
 
-- 只是想停止把前面的闲聊带入新任务：使用 `/new`。
-- 想删除一整个旧对话：先用 `agent-os sessions list` 找到它，再执行 `sessions purge`；有 ACTIVE Goal 的 Session 会拒绝删除。
-- 想删除一条长期偏好或事实：用 `memory list` 找到 ID，再执行 `memory forget`。
-- 事实发生变化但要保留历史：新增记忆时用 `--supersedes <id>`；仅需停止召回时用 `memory retract`。
-- 删除 Session 不会删除长期记忆；删除长期记忆也不会篡改历史对话，两种数据必须分别处理。
+- If you only want to avoid carrying smalltalk into a new task, use `/new`.
+- To delete an old conversation, locate it with `agent-os sessions list` and run `sessions purge`; active Goal sessions are protected from deletion.
+- To delete one long-term preference or fact, locate the ID with `memory list` and run `memory forget`.
+- If facts changed but history should be preserved, use `--supersedes <id>` when adding new memory; use `memory retract` when only recall should stop.
+- Deleting a Session does not delete long-term memory; deleting long-term memory does not alter historical dialog. They must be managed separately.
 
-## 一个驾驶舱，多个思考线程
+### Portable memory and cloud/CAS synchronization
 
-终端只有一个输入区，不代表系统只有一个任务。它更接近人的统一意识与注意力入口：人只有一个当前表达出口，但大脑里可以同时保留多个正在执行、等待、休眠和被打断的工作线程。
+A Memory Bundle is a versioned JSON package whose canonical JSON payload produces a `sha256:` content address. A configurable Ed25519 signer can sign payloads, and another Agent OS only needs the matching public key to verify publisher identity. When `activeKeyId` is enabled, signed payloads are wrapped in an AES-256-GCM envelope; remote pull/push default to requiring encryption, and CAS object names use the encrypted envelope digest while inner `payloadDigest` remains for auditing identical cognitive content. Encryption nonce is deterministically derived from `key + signed inner payload`, so unchanged signed snapshots keep stable addresses while changing signer, signature, or content changes the nonce.
+
+Signatures prove source, not correctness. Imported memories default to `CANDIDATE` and do not enter FTS recall or model context until `memory confirm`, local `--activate`, or trusted remote signature with explicit `autoActivate` moves them to `ACTIVE`. Remote payloads must pass envelope verification, decryption, payload digest, and signature checks before database insert.
+
+Import IDs derive from source `portableId + recordDigest` and are transport-independent. Re-exported imported memory restores original portable fields and does not nest `CANDIDATE` payloads repeatedly; returning to a source device matches the original record. Bidirectional cloud sync or multi-node relay therefore avoids duplicate copies on each hop. Changed content creates a distinct reviewable revision, rather than silently replacing prior cognition.
+
+Built-in provider types:
+
+- `file`: overridable local private snapshot.
+- `directory-cas`: immutable object store by bundle digest for sync drives or local decentralized directories.
+- `https`: fixed cloud snapshot endpoint, GET pull and POST/PUT push.
+- `https-cas`: HTTPS content-addressed store by digest; push uses conditional PUT and pull requires explicit digest.
+- Trusted plugins can integrate `registerMemoryProvider(id, adapter)` for IPFS, Arweave, S3, Dropbox, or enterprise object-store protocols.
+
+Remote pull requires trusted signatures by default; remote push requires configured signer. HTTPS requests inherit Runtime DNS pinning, SSRF checks, redirect rules, timeout, and size limits. Provider tokens can only be injected via environment variables or private SecretRef. Sample config:
+
+```json
+{
+  "memory": {
+    "portability": {
+      "pollMs": 30000,
+      "maxConcurrentSyncs": 2,
+      "maxBundleBytes": 4000000,
+      "maxEntries": 5000,
+      "maxImportedConfidence": 0.6,
+      "requireSignatureForRemote": true,
+      "encryption": {
+        "requireForRemote": true,
+        "activeKeyId": "personal-v1",
+        "keys": {
+          "personal-v1": {
+            "keyEnv": "AGENT_MEMORY_ENCRYPTION_KEY"
+          }
+        }
+      },
+      "signer": {
+        "id": "personal-laptop",
+        "privateKeyEnv": "AGENT_MEMORY_PRIVATE_KEY"
+      },
+      "trustedSigners": {
+        "personal-laptop": {
+          "publicKeyEnv": "AGENT_MEMORY_PUBLIC_KEY"
+        }
+      },
+      "providers": {
+        "personal-cloud": {
+          "type": "https",
+          "url": "https://memory.example.com/v1/snapshot",
+          "tokenEnv": "AGENT_MEMORY_PROVIDER_TOKEN",
+          "pullIntervalMs": 300000,
+          "pushIntervalMs": 300000,
+          "autoActivate": false
+        },
+        "decentralized-cas": {
+          "type": "https-cas",
+          "url": "https://cas.example.com/agent-memory/",
+          "tokenEnv": "AGENT_MEMORY_PROVIDER_TOKEN"
+        }
+      }
+    }
+  }
+}
+```
+
+Environment variables can store PEM or single-line base64 DER. Generate Ed25519 key:
+
+```bash
+openssl genpkey -algorithm Ed25519 -out memory-private.pem
+export AGENT_MEMORY_PRIVATE_KEY="$(openssl pkey -in memory-private.pem -outform DER | openssl base64 -A)"
+export AGENT_MEMORY_PUBLIC_KEY="$(openssl pkey -in memory-private.pem -pubout -outform DER | openssl base64 -A)"
+export AGENT_MEMORY_ENCRYPTION_KEY="$(openssl rand -base64 32)"
+```
+
+`keys` can retain old and new keys to decrypt historical bundles, while only `activeKeyId` applies to new exports, enabling seamless rotation. For multi-device personal Agents, all devices can share one encryption key while each device has an independent Ed25519 signer; this preserves decryption sharing while still attributing each memory to a specific publisher. Production should prefer `keyRef` pointing to private `secrets.json`; do not put keys in `config.json`.
+
+Synchronization runs in a dedicated persistent `memory-sync-reactor`. `maxConcurrentSyncs` controls provider worker pool size; network waits still heartbeat, so a slow provider does not occupy Scheduler, block other memory channels, or falsely indicate daemon failure. Each pull, push, import, and export is persisted in `memory_sync_runs` and can be checked via `memory syncs` or `/memory-sync`.
+
+## One cockpit, multiple thinking threads
+
+One terminal input area does not mean one task. The system behaves more like human unified awareness and attention: one immediate expression channel can host many active, waiting, sleeping, and preempted thinking threads.
 
 ```text
 Terminal / channels / monitors
@@ -272,7 +365,7 @@ Terminal / channels / monitors
        └── work completed
               │
               ▼
-      Focus & Input Router
+       Focus & Input Router
        ├── resume exact wait
        ├── create child goal
        ├── create parallel goal
@@ -282,22 +375,22 @@ Terminal / channels / monitors
        Persistent Goal/Task DAGs
 ```
 
-输入路由遵循确定性优先原则：
+Input routing follows deterministic priority:
 
-1. 已 focus 的 Goal 正在等待用户时，普通输入直接恢复它。
-2. 当前 Session 只有一个明确的 `user.reply` 等待项时，普通输入自动成为它的回复。
-3. 存在多个候选等待线程时，系统不会用模型冒险猜测，而是要求通过 `/inbox` 和 `/reply <id>` 选择。
-4. 没有等待项时，普通输入创建新的前台 Goal；`/task` 强制创建并行后台 Goal。
-5. `/focus` 下的新工作会成为原 Goal 的子 Goal，继承并进一步收窄预算、deadline 和 capabilities。
-6. `/interrupt` 创建高优先级 Goal，原线程在安全 checkpoint 被抢占并稍后恢复。
+1. If a focused Goal is waiting for user input, normal input resumes it directly.
+2. If the current Session has exactly one pending `user.reply`, normal input becomes that reply automatically.
+3. If multiple waiting candidates exist, the system requires explicit choice through `/inbox` and `/reply <id>` instead of model guessing.
+4. Without waiting items, normal input creates a new foreground Goal; `/task` forces parallel background Goal submission.
+5. Work under `/focus` becomes a child Goal and further constrains budget, deadline, and capabilities.
+6. `/interrupt` creates a high-priority Goal, preempting the current thread at a safe checkpoint for later resumption.
 
-CPU 负责状态机、队列、匹配、唤醒和抢占；LLM 只在需要理解目标、选择路径或处理语义歧义的认知步骤中调用。终端可以关闭，也可以同时从多个终端、消息渠道、Monitor 或外部事件入口投递工作；Goal 生命周期始终属于常驻 Kernel。
+The CPU handles state machine, queueing, matching, wake-up, and preemption; LLM is invoked only for cognitive steps requiring interpretation, path selection, or semantic disambiguation. The terminal can be closed, and work can arrive from multiple terminals, message channels, monitors, or external event inputs while Goal lifecycle remains in the persistent kernel.
 
-## 实时通道等待
+## Real-time channel waiting
 
-`WAITING` 不只是数据库状态。支持入站的 Channel 可以提供一个常驻 `listen()` adapter，例如 IMAP IDLE、Slack Socket Mode、WebSocket、Redis Streams、NATS 或设备消息连接。插件加载后，这个监听器会被 Kernel Supervisor 当作独立常驻服务启动、heartbeat、故障重启和关闭。
+`WAITING` is more than a database status. Inbound channels can provide a persistent `listen()` adapter such as IMAP IDLE, Slack Socket Mode, WebSocket, Redis Streams, NATS, or device-message connections. After plugin load, this listener is started by Kernel Supervisor as a persistent independent service with heartbeat, restart on failure, and clean shutdown.
 
-Agent 调用 `wait_for_channel` 时指定 `channel + accountId + threadKey`：
+When an Agent calls `wait_for_channel`, it specifies `channel + accountId + threadKey`:
 
 ```text
 Task A calls wait_for_channel
@@ -317,9 +410,9 @@ Resident channel listener receives a message
   → LLM evaluates the received information and decides the next action
 ```
 
-入站消息和 Event 之间采用可恢复交付：消息先进入 `channel_messages`，状态为 `PENDING`；发布 durable event 后改为 `DELIVERED`。如果进程在两次提交之间崩溃，I/O Reactor 会重放仍为 PENDING 的消息；event idempotency key 防止重复唤醒。事件早于 Task 订阅到达也不会丢失。
+Inbound messages and events support resumable delivery: messages enter `channel_messages` with `PENDING`; after durable event publish they become `DELIVERED`. If the process crashes between commits, I/O Reactor replays pending messages; event idempotency keys prevent double wake-up. Messages that arrive before task subscription are not lost.
 
-内置 `webhook` Channel 可通过 Gateway 接收已认证消息：
+Built-in `webhook` Channel accepts authenticated messages through Gateway:
 
 ```bash
 curl -X POST http://127.0.0.1:3030/api/channels/webhook/messages \
@@ -335,19 +428,19 @@ curl -X POST http://127.0.0.1:3030/api/channels/webhook/messages \
   }'
 ```
 
-生产 Channel 插件调用 `registerChannel(id, { listen, send })`。`listen({ signal, heartbeat, ingest })` 持续保持外部连接，并在收到消息时调用 `ingest(...)`；Adapter 不直接操作 Task，也不需要持有模型 Context。
+Production Channel plugins call `registerChannel(id, { listen, send })`. `listen({ signal, heartbeat, ingest })` keeps external connections alive and calls `ingest(...)` on message arrival; adapters do not manipulate Tasks directly and must not hold model context.
 
-## 空闲感知
+## Idle perception
 
-每个 Agent 默认创建一个 `workspace_inbox` Monitor，并启动一个受监督的文件系统 Listener。Gateway 即使没有 Goal，也会持续：
+Each Agent creates a default `workspace_inbox` Monitor and starts a supervised filesystem Listener. Even without a Goal, Gateway continuously:
 
-1. 写入 `runtime.pulse`，记录 liveness、线程、等待和注意力状态。
-2. 监听操作系统文件通知并即时唤醒 Monitor，同时按 interval 轮询防止通知丢失。
-3. 比较本次 observation 与上一次持久状态。
-4. 变化时写入 `monitor.changed` durable event。
-5. `autoGoal` 开启时创建一个新的内部 Session Goal，让 Agent 对变化作出判断。
+1. Writes `runtime.pulse` recording liveness, threads, waits, and attention state.
+2. Watches OS notifications and wakes Monitor immediately, while also polling by interval to avoid missed events.
+3. Compares current observation with previous persisted state.
+4. Writes `monitor.changed` durable event on change.
+5. When `autoGoal` is enabled, creates a new internal Session Goal for Agent judgment.
 
-例如把文件放入：
+For example, drop a file:
 
 ```bash
 cp request.txt data/workspace/inbox/
@@ -355,13 +448,13 @@ agent-os events list --topic monitor.changed
 agent-os goals list
 ```
 
-Monitor 有独立 revision、lease、failure backoff、last state 和 observation ledger；Gateway 重启不会丢失其感知进度。插件可增加邮件轮询 Sensor，也可增加 IMAP IDLE、WebSocket、GitHub stream、消息队列或设备连接等真正常驻的 Listener。
+Monitors have independent revision, lease, failure backoff, last state, and observation ledger; Gateway restarts do not lose perception progress. Plugins can add email polling Sensors, IMAP IDLE, WebSocket, GitHub stream, message queue, or device connection listeners.
 
-空闲认知进程一直存在，但默认 `autoReflect=false`，不会静默产生模型费用。它不再仅按定时器反思：Attention Allocator 会先计算 deadline 风险、失败/抢占造成的偏移、新 observation、共享账号或显式 conflict key、长期阻塞，以及预计反思价值与模型成本。只有得分和值得性达到阈值时，才会唤醒一个有独立预算和只读能力的反思 Goal；critical signal 还可以通过 durable interrupt 请求抢占低优先级工作。
+Idle cognition is always present but default `autoReflect=false`, so no silent model spend occurs. It no longer reflects only on a timer: Attention Allocator computes deadline risk, drift from failure/preemption, new observations, shared account or explicit conflict keys, and expected reflection value versus model cost. Only when score and value pass threshold does it wake a read-only, budgeted reflection Goal; critical signals can still issue durable interrupts to preempt low-priority work.
 
-## Goal Contract 与安全边界
+## Goal Contract and security boundaries
 
-提交时可以收窄默认预算和能力：
+When submitting a job, you can narrow default budgets and capabilities:
 
 ```bash
 agent-os run "Prepare the release evidence" \
@@ -370,37 +463,39 @@ agent-os run "Prepare the release evidence" \
   --capabilities '{"tools":["memory_search","workspace_list","workspace_read"],"resourcePools":["default","memory","filesystem"],"filesystem":{"roots":["release"],"operations":["list","read"]},"network":{"domains":[],"methods":[]},"accounts":{},"dataScopes":["agent:self"],"credentialRefs":[]}'
 ```
 
-Contract 与 Goal/Task 在同一个 SQLite transaction 中创建。子 Goal 只能继承父 Contract 的子集，并且 deadline、能力到期时间、预算、fan-out 和深度都不能扩张。Gateway 固定绑定一个 `security.tenantId`；不同 tenant 的强隔离部署方式是分别运行 Kernel、数据库、配置和 workspace。单个 Kernel 内的多个 Agent 通过不同 workspace、Goal ownership、Session/Memory/Event tenant scope 和 capability contract 做逻辑隔离。
+Contract and Goal/Task are created in the same SQLite transaction. Child Goals inherit only subsets of parent Contract and cannot expand deadline, capability expiry, budgets, fan-out, or depth. Gateway is bound to one `security.tenantId`; strict tenant isolation runs separate Kernel, database, config, and workspace. Multiple Agents inside one Kernel are logically isolated using workspace boundaries, Goal ownership, Session/Memory/Event tenant scope, and capability contract.
 
-工具还可以把业务参数映射到通用 `constraints`。例如邮件能力可以同时冻结 `accounts.email=["primary"]`、`credentialRefs=["mail-primary"]`、`constraints.email.recipients=["*@example.com"]`、`messageTypes=["transactional"]`、`maxRecipientsPerCall=2` 和 `maxBodyChars=10000`。子 Goal 只能进一步缩小名单或数值上限；deadline 与费用/工具调用预算仍由同一 Contract 约束。因此授权表达的是“哪个 Goal 在什么期限和预算内，用哪个账号给哪些对象执行哪类动作”，而不只是“是否能调用邮件工具”。
+Tools can map business parameters to generic `constraints`. For example, mail capability can freeze `accounts.email=["primary"]`, `credentialRefs=["mail-primary"]`, `constraints.email.recipients=["*@example.com"]`, `messageTypes=["transactional"]`, `maxRecipientsPerCall=2`, and `maxBodyChars=10000`. Child Goals may further narrow lists or limits, while deadline and token/tool budgets remain constrained by the same Contract. Authorization therefore means exactly which Goal can perform which action, on which objects, in which time and budget, not merely whether a tool is callable.
 
-外部事件入口默认要求 HMAC。`security.events.sourceSecrets` 保存的是 `env:VARIABLE` 引用，例如 `{"cli":"env:AGENT_EVENT_CLI_SECRET"}`。签名覆盖 timestamp、nonce、topic、correlation key、tenant、agent 和 canonical payload；nonce 在数据库中唯一，过期 timestamp 或 replay 会被拒绝。
+External event entry points require HMAC by default. `security.events.sourceSecrets` stores references like `env:VARIABLE`, for example `{"cli":"env:AGENT_EVENT_CLI_SECRET"}`. Signatures use `agent-os-event-v1` domain separation across source, timestamp, nonce, topic, correlation key, tenant, agent, and canonical payload. Nonce is unique in DB and requests with expired timestamp, reused nonce, or content replay are rejected. Internal topics include `approval.resolved`, `goal.completed`, `channel.message`, `monitor.changed`, and `cognition.attention`; external event APIs cannot inject them.
 
-Resource Pool 在当前单机版本中是进程内的可中断 semaphore，不是容器。`browser` 和 `code` Tool 若没有已注册 sandbox adapter 会在注册阶段被拒绝；adapter 本身是受信插件边界，生产部署应让它调用容器、VM、受限 Worker 或远程执行服务。
+Model requests default to public HTTPS or loopback HTTP endpoints. All addresses are resolved and validated before connect; outgoing traffic is fixed to validated endpoints and does not follow redirects, preventing DNS rebinding, credential redirect, and SSRF patterns. If private HTTPS model access is truly required, set `allowPrivateNetwork: true` on that model; security audit marks it high risk.
 
-## 副作用协议
+Resource pool in current single-machine release is an interruptible in-process semaphore, not containers. `browser` and `code` Tools without a registered sandbox adapter declaring process/container/microvm isolation are rejected at registration. The adapter itself is a trusted plugin boundary; production deployments still must verify it truly invokes containers, VMs, restricted Workers, or remote execution services.
 
-有外部副作用的 Tool 声明 `sideEffect.mode`，Runtime 为每个 idempotency key 创建 operation record。可恢复流程为 `prepare → execute → confirm`；请求超时或进程在 `EXECUTING` 中退出时进入 `UNCERTAIN`，后台 I/O Reactor 调用 Tool 的 `reconcile` 查询外部事实。确认成功后保存外部结果；确认不存在时才允许再次执行；支持撤销的 Tool 可由 CLI/API 执行 compensation。
+## Side-effect protocol
 
-`messages + outbox` 已在一个本地 transaction 中提交。本地写入类 Tool 使用稳定对象 ID 实现 crash-safe replay。对于既不幂等、又无法查询、也无法撤销的旧系统，Runtime 强制审批和单槽隔离，并在结果不确定时停止自动化，等待人工 reconcile；系统不会虚构 exactly-once。
+Tools with external side effects declare `sideEffect.mode`; runtime creates an operation record for each idempotency key. The recoverable path is `prepare → execute → confirm`. If request times out or process exits in `EXECUTING`, it transitions to `UNCERTAIN`, and background I/O Reactor invokes Tool `reconcile` to query external fact. When confirmation succeeds, external result is persisted; re-execution occurs only if confirmation is absent. Tools supporting compensation can be rolled back via CLI/API compensation.
 
-## 异步恢复状态
+`messages + outbox` are committed in one local transaction. Local write tools use stable object IDs for crash-safe replay. For legacy non-idempotent, non-queryable, and non-compensatable systems, runtime enforces approval and single-slot isolation, and pauses automation until human reconcile when results are uncertain. The system does not invent exactly-once behavior.
 
-普通工具返回 JSON。需要等待的工具返回 `ActionControl.wait(...)`。Runtime 会持久化：
+## Asynchronous recovery states
 
-- workflow `pc`、step graph 和 variables
-- 模型 messages、未完成 tool call 与 tool-local state
-- event topic、correlation key、deadline 和 pending event
-- checkpoints、必要证据、结果、错误和审计轨迹
-- task lease、revision、pause/cancel intent 和重试状态
+Normal tool calls return JSON. Tools that need waiting return `ActionControl.wait(...)`. Runtime persists:
 
-收到匹配事件后，原 tool call 从保存的 step 继续，而不是重新执行完整对话。系统不声称冻结模型不可见的内部思维链；恢复所依赖的是可序列化、可审计的外部推理状态。
+- workflow `pc`, step graph, and variables
+- model messages, pending tool calls, and tool-local state
+- event topic, correlation key, deadline, and pending event
+- checkpoints, required evidence, results, errors, and audit trace
+- task lease, revision, pause/cancel intent, and retry state
 
-## 内置工具
+When a matching event arrives, the original tool call resumes from the saved step instead of replaying the full conversation. The runtime does not claim to preserve invisible in-model internal thought chains; restoration uses serializable, auditable external reasoning state.
 
-- `memory_search`、`memory_remember`、`memory_confirm`、`memory_forget`
+## Built-in tools
+
+- `memory_search`, `memory_remember`, `memory_confirm`, `memory_forget`
 - `plan_assume`
-- `workspace_list`、`workspace_read`、`workspace_write`、`workspace_delete`
+- `workspace_list`, `workspace_read`, `workspace_write`, `workspace_delete`
 - `http_fetch`
 - `request_user_input`
 - `wait_for_event`
@@ -415,10 +510,11 @@ Resource Pool 在当前单机版本中是进程内的可中断 semaphore，不�
 
 ## Headless API
 
-CLI 通过本地 Gateway API 工作。提交消息立即返回 accepted，不等待模型或工具结束：
+CLI works through local Gateway API. Submissions return accepted immediately and do not wait for model or tool completion:
 
 ```bash
 curl -X POST http://127.0.0.1:3030/api/v1/messages \
+  -H "authorization: Bearer $AGENT_GATEWAY_TOKEN" \
   -H 'content-type: application/json' \
   -d '{
     "messageId":"terminal-001",
@@ -429,33 +525,33 @@ curl -X POST http://127.0.0.1:3030/api/v1/messages \
   }'
 ```
 
-主要端点：
+Key endpoints:
 
-- `GET /api/health`、`GET /api/diagnostics`、`GET /api/metrics`、`GET /api/dashboard`
-- `GET /api/inbox`、`POST /api/inbox/reply`
-- `GET /api/channels/messages`、`POST /api/channels/:id/messages`
-- `GET /api/kernel`、`GET /api/kernel/processes`
-- `GET /api/resources`、`GET /api/attention`
-- `GET /api/operations`、`GET /api/operations/:id`
+- `GET /api/health`, `GET /api/diagnostics`, `GET /api/metrics`, `GET /api/dashboard`
+- `GET /api/inbox`, `POST /api/inbox/reply`
+- `GET /api/channels/messages`, `POST /api/channels/:id/messages`
+- `GET /api/kernel`, `GET /api/kernel/processes`
+- `GET /api/resources`, `GET /api/attention`
+- `GET /api/operations`, `GET /api/operations/:id`
 - `POST /api/operations/:id/reconcile|compensate`
-- `GET /api/goals/:id/contract|plan|trace`、`POST /api/goals/:id/capabilities/revoke`
-- `GET/POST /api/credentials`、`POST /api/credentials/:id/revoke`
+- `GET /api/goals/:id/contract|plan|trace`, `POST /api/goals/:id/capabilities/revoke`
+- `GET/POST /api/credentials`, `POST /api/credentials/:id/revoke`
 - `GET/POST /api/interrupts`
-- `GET /api/cognition`、`POST /api/cognition/enable|disable|reflect`
-- `GET/POST /api/goals`、`GET /api/goals/:id`
-- `GET /api/tasks`、`GET /api/tasks/:id`、`POST /api/tasks/:id/pause|resume|cancel`
-- `GET /api/sessions`、`GET /api/sessions/:id`、`POST /api/sessions/:id/purge`
-- `GET/POST /api/memories`、`POST /api/memories/:id/forget|confirm|status`
-- `GET /api/approvals`、`POST /api/approvals/:id/resolve`
+- `GET /api/cognition`, `POST /api/cognition/enable|disable|reflect`
+- `GET /api/goals`, `GET /api/goals/:id`
+- `GET /api/tasks`, `GET /api/tasks/:id`, `POST /api/tasks/:id/pause|resume|cancel`
+- `GET /api/sessions`, `GET /api/sessions/:id`, `POST /api/sessions/:id/purge`
+- `GET/POST /api/memories`, `POST /api/memories/:id/forget|confirm|status`
+- `GET /api/approvals`, `POST /api/approvals/:id/resolve`
 - `GET/POST /api/schedules`
-- `GET/POST /api/monitors`、`GET /api/monitors/:id`
+- `GET/POST /api/monitors`, `GET /api/monitors/:id`
 - `POST /api/monitors/:id/run|enable|disable`
 - `GET/POST /api/events`
-- `GET /api/audit`、`GET /api/outbox`、`GET /api/stream`
+- `GET /api/audit`, `GET /api/outbox`, `GET /api/stream`
 
-## 插件
+## Plugins
 
-插件只能从 `security.pluginPaths` 显式加载，可注册 Tool、Action、Channel、Hook、Sensor 和受监督的常驻 Listener。示例见 [time-plugin.js](examples/plugins/time-plugin.js)。
+Plugins can only be loaded from explicit `security.pluginPaths`, and can register Tool, Action, Channel, Hook, Sensor, and supervised persistent Listener. See example [time-plugin.js](examples/plugins/time-plugin.js).
 
 ```js
 export default {
@@ -469,11 +565,11 @@ export default {
 };
 ```
 
-## 验证
+## Validation
 
 ```bash
 npm run check
 npm run doctor
 ```
 
-测试覆盖：跨目标并发、外部等待/恢复、早到事件、重启恢复、事件幂等、Session DAG、可挂起模型工具、高风险审批、时态与矛盾记忆、计划版本与观察驱动修复、语义资源互斥、计划任务、任务控制、子目标并行汇合，以及系统空闲时 pulse 与 sensor 唤起新目标。
+Test coverage includes concurrent Goals, external wait/recovery, early events, restart recovery, idempotency, Session DAG, suspend-capable model tools, high-risk approval, temporal and contradictory memory, plan versioning and observation-driven repair, semantic resource mutual exclusion, schedules, task controls, child-goal parallel convergence, and idle pulse plus sensor-triggered new goals.

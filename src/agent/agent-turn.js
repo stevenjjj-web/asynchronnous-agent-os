@@ -2,12 +2,10 @@ import { createHash } from 'node:crypto';
 import { ActionControl, isActionControl } from './tool-registry.js';
 
 function parseArguments(raw) {
-  try {
-    const value = JSON.parse(raw || '{}');
-    return value && typeof value === 'object' ? value : {};
-  } catch {
-    return {};
-  }
+  if (typeof raw !== 'string' || raw.length > 1_000_000) throw new Error('Tool arguments are invalid or oversized');
+  const value = JSON.parse(raw || '{}');
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Tool arguments must be a JSON object');
+  return value;
 }
 
 function assistantMessage(response) {
@@ -109,12 +107,13 @@ export class AgentTurnService {
 
     for (let iteration = 0; iteration < 8; iteration += 1) {
       const prepared = await this.hooks.emit('before_model_call', { session, task: context.task, messages });
+      if (prepared.cancelled) throw new Error('Model call cancelled by policy');
       const modelMessages = prepared.messages ?? messages;
       const modelConfig = selectedModel.modelConfig;
       const allowance = this.resources?.assertModelCall(context.task.goal_id, modelMessages, modelConfig);
       const response = await selectedModel.provider.complete({
         messages: modelMessages,
-        tools: this.tools.modelDefinitions(),
+        tools: this.tools.modelDefinitions(context.task.goal_id),
         signal: context.signal,
         maxTokens: allowance?.maxOutputTokens,
       });
@@ -142,7 +141,13 @@ export class AgentTurnService {
 
       for (const call of response.toolCalls) {
         const tool = this.tools.get(call.name);
-        const args = parseArguments(call.arguments);
+        let args;
+        try {
+          args = parseArguments(call.arguments);
+        } catch (error) {
+          messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ ok: false, error: error.message }) });
+          continue;
+        }
         if (!tool) {
           messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ ok: false, error: `Unknown tool: ${call.name}` }) });
           continue;

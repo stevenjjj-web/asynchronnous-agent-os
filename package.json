@@ -1,6 +1,6 @@
 {
   "name": "agent-os-runtime",
-  "version": "0.10.0",
+  "version": "0.12.0",
   "private": true,
   "description": "Resident asynchronous personal agent operating system with supervised services, durable goals, interrupts and long-term memory",
   "type": "module",
@@ -16,9 +16,10 @@
     "doctor": "node src/cli.js doctor",
     "build": "node --check src/server.js && node --check src/cli.js",
     "test": "node --test",
-    "check": "node --check src/server.js && node --check src/cli.js && node --test"
+    "check": "node --check src/server.js && node --check src/cli.js && node --test",
+    "security:audit": "node src/cli.js security audit --json"
   },
   "engines": {
-    "node": ">=22.5"
+    "node": ">=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0"
   }
 }

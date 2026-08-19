@@ -4,6 +4,7 @@ export class OperationManager {
     this.config = config;
     this.pools = pools;
     this.handlers = new Map();
+    this.inFlight = new Map();
   }
 
   registerTool(tool) {
@@ -11,6 +12,23 @@ export class OperationManager {
   }
 
   async execute(tool, args, context, invoke) {
+    const key = context.idempotencyKey;
+    if (!key) throw new Error(`Side-effect tool ${tool.name} requires an idempotency key`);
+    const fingerprint = this.fingerprint(tool, args, context);
+    const active = this.inFlight.get(key);
+    if (active) {
+      if (active.fingerprint !== fingerprint) throw new Error(`Idempotency key was reused for a different operation: ${key}`);
+      return active.promise;
+    }
+    const promise = this.executeOnce(tool, args, context, invoke)
+      .finally(() => {
+        if (this.inFlight.get(key)?.promise === promise) this.inFlight.delete(key);
+      });
+    this.inFlight.set(key, { fingerprint, promise });
+    return promise;
+  }
+
+  async executeOnce(tool, args, context, invoke) {
     const descriptor = tool.sideEffect;
     if (!descriptor) return invoke();
     const mode = descriptor.mode ?? 'idempotent';
@@ -55,7 +73,10 @@ export class OperationManager {
       }
     }
 
-    this.store.transitionOperation(operation.id, 'EXECUTING', { incrementAttempt: true });
+    this.store.transitionOperation(operation.id, 'EXECUTING', {
+      incrementAttempt: true,
+      expectedState: operation.state,
+    });
     try {
       const result = await invoke();
       if (descriptor.confirm) {
@@ -85,24 +106,41 @@ export class OperationManager {
   }
 
   assertReplayMatches(operation, tool, args, context) {
-    const canonical = (value) => {
-      if (Array.isArray(value)) return value.map(canonical);
-      if (value && typeof value === 'object') {
-        return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])]));
-      }
-      return value;
-    };
-    const expected = JSON.stringify(canonical(operation.request ?? {}));
-    const actual = JSON.stringify(canonical(args ?? {}));
+    const expected = this.canonicalJson(operation.request ?? {});
+    const actual = this.canonicalJson(args ?? {});
     if (
       operation.tool_name !== tool.name
       || operation.mode !== (tool.sideEffect?.mode ?? 'idempotent')
+      || operation.resource_pool !== tool.resourcePool
       || operation.goal_id !== context.task.goal_id
       || operation.task_id !== context.task.id
       || expected !== actual
     ) {
       throw new Error(`Idempotency key was reused for a different operation: ${context.idempotencyKey}`);
     }
+  }
+
+  fingerprint(tool, args, context) {
+    return this.canonicalJson({
+      goalId: context.task?.goal_id,
+      taskId: context.task?.id,
+      tool: tool.name,
+      mode: tool.sideEffect?.mode ?? 'idempotent',
+      resourcePool: tool.resourcePool,
+      request: args ?? {},
+    });
+  }
+
+  canonicalJson(value) {
+    const canonical = (entry, depth = 0) => {
+      if (depth > 64) throw new Error('Operation input exceeds the maximum nesting depth');
+      if (Array.isArray(entry)) return entry.map((item) => canonical(item, depth + 1));
+      if (entry && typeof entry === 'object') {
+        return Object.fromEntries(Object.keys(entry).sort().map((key) => [key, canonical(entry[key], depth + 1)]));
+      }
+      return entry;
+    };
+    return JSON.stringify(canonical(value));
   }
 
   async reconcile(operation, tool = this.handlers.get(operation.tool_name), { acquirePool = true } = {}) {

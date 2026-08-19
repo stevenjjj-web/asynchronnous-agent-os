@@ -2,6 +2,9 @@ import { randomUUID } from 'node:crypto';
 
 export class IntentPlanner {
   compile(objective, options = {}) {
+    if (typeof objective !== 'string' || !objective.trim() || objective.length > 200_000) {
+      throw new Error('Goal objective must contain 1 to 200000 characters');
+    }
     const goalId = randomUUID();
     const clarifyId = randomUUID();
     const contextId = randomUUID();
@@ -10,7 +13,13 @@ export class IntentPlanner {
     const reviewId = randomUUID();
     const replyKey = `goal:${goalId}:requirements`;
     const requireReply = options.requireReply !== false;
-    const priority = Math.max(10, Math.min(100, Number(options.priority ?? 80)));
+    const requestedPriority = Number(options.priority ?? 80);
+    if (!Number.isFinite(requestedPriority)) throw new Error('Goal priority must be a finite number');
+    const priority = Math.max(10, Math.min(100, Math.round(requestedPriority)));
+    const replyTimeoutMs = Number(options.replyTimeoutMs ?? 86_400_000);
+    if (!Number.isInteger(replyTimeoutMs) || replyTimeoutMs < 1_000 || replyTimeoutMs > 31_536_000_000) {
+      throw new Error('replyTimeoutMs must be an integer between 1000 and 31536000000');
+    }
 
     const clarifyWorkflow = [
       { type: 'record', message: 'Analyzing the user goal and confirming success criteria' },
@@ -20,7 +29,7 @@ export class IntentPlanner {
         correlationKey: replyKey,
         saveAs: 'userReply',
         reason: 'Critical constraints require user input. The task is suspended and its execution slot has been released.',
-        timeoutMs: options.replyTimeoutMs ?? 86_400_000,
+        timeoutMs: replyTimeoutMs,
       }] : [{ type: 'set', name: 'userReply', value: { message: 'No external input is required' } }]),
       { type: 'record', message: 'External reply received: {{userReply.message}}. Resuming from the saved snapshot.' },
       {

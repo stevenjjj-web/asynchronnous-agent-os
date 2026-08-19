@@ -30,9 +30,16 @@ export class ResourceKernel {
       ? this.store.getGoalContract(parentGoalId)?.budget
       : this.config.resources.goalDefaults;
     if (!ceiling) throw new Error(`Missing parent goal contract: ${parentGoalId}`);
+    if (!requested || typeof requested !== 'object' || Array.isArray(requested)) throw new ResourceLimitError('Goal budget must be an object');
+    for (const [key, rawValue] of Object.entries(requested)) {
+      if (!Object.prototype.hasOwnProperty.call(ceiling, key)) throw new ResourceLimitError(`Unknown budget field: ${key}`);
+      const value = Number(rawValue);
+      if (!Number.isFinite(value) || value < 0) throw new ResourceLimitError(`Budget field ${key} must be a non-negative number`);
+      if (value > Number(ceiling[key])) throw new ResourceLimitError(`Budget field ${key} exceeds its capability ceiling`, { value, maximum: ceiling[key] });
+    }
     return Object.fromEntries(Object.entries(ceiling).map(([key, maximum]) => [
       key,
-      Math.min(finite(requested[key], maximum), maximum),
+      Object.prototype.hasOwnProperty.call(requested, key) ? Number(requested[key]) : maximum,
     ]));
   }
 
@@ -156,6 +163,13 @@ export class ResourceKernel {
   recordModelUsage({ goalId, usage, estimatedInputTokens = 0, estimatedOutputTokens = 0, modelConfig = {}, idempotencyKey }) {
     const inputTokens = Number(usage?.prompt_tokens ?? usage?.input_tokens ?? estimatedInputTokens);
     const outputTokens = Number(usage?.completion_tokens ?? usage?.output_tokens ?? estimatedOutputTokens);
+    if (!Number.isFinite(inputTokens) || inputTokens < 0 || !Number.isFinite(outputTokens) || outputTokens < 0) {
+      throw new ResourceLimitError('Model provider returned invalid token usage');
+    }
+    if (!Number.isFinite(Number(modelConfig.inputCostPerMillion ?? 0)) || Number(modelConfig.inputCostPerMillion ?? 0) < 0
+      || !Number.isFinite(Number(modelConfig.outputCostPerMillion ?? 0)) || Number(modelConfig.outputCostPerMillion ?? 0) < 0) {
+      throw new ResourceLimitError('Model pricing configuration is invalid');
+    }
     const inputCost = inputTokens * Number(modelConfig.inputCostPerMillion ?? 0) / 1_000_000;
     const outputCost = outputTokens * Number(modelConfig.outputCostPerMillion ?? 0) / 1_000_000;
     const records = [
